@@ -165,9 +165,8 @@ const BASE_CONTEXT = {
 
 function makeDeps(overrides: Partial<ScorerDeps> = {}): ScorerDeps {
   return {
-    checkAIAccess:    vi.fn().mockResolvedValue(true),
+    llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: '{"score":82,"reason":"High risk","confidence":"high"}', provider: 'anthropic', model: null, usage: { inputTokens: 100, outputTokens: 20 } }) },
     fetchContext:     vi.fn().mockResolvedValue(BASE_CONTEXT),
-    callClaude:       vi.fn().mockResolvedValue({ text: '{"score":82,"reason":"High risk","confidence":"high"}', inputTokens: 100, outputTokens: 20 }),
     updateGroupScore: vi.fn().mockResolvedValue(undefined),
     sendGroupScored:  vi.fn().mockResolvedValue(undefined),
     logTokens:        vi.fn(),
@@ -178,7 +177,7 @@ function makeDeps(overrides: Partial<ScorerDeps> = {}): ScorerDeps {
 describe('runScorer', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('returns correct score and reason from valid Claude response', async () => {
+  it('returns correct score and reason from valid LLM response', async () => {
     const deps   = makeDeps()
     const result = await runScorer(BASE_PAYLOAD, deps)
 
@@ -188,9 +187,9 @@ describe('runScorer', () => {
     expect(result.skipped).toBeUndefined()
   })
 
-  it('uses fallback score when Claude returns invalid JSON', async () => {
+  it('uses fallback score when LLM returns invalid JSON', async () => {
     const deps = makeDeps({
-      callClaude: vi.fn().mockResolvedValue({ text: 'I cannot score this', inputTokens: 50, outputTokens: 10 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: 'I cannot score this', provider: 'anthropic', model: null, usage: { inputTokens: 50, outputTokens: 10 } }) },
     })
     const result = await runScorer(BASE_PAYLOAD, deps)
 
@@ -211,14 +210,14 @@ describe('runScorer', () => {
 
   it('does NOT trigger group.scored when score <= 50', async () => {
     const deps = makeDeps({
-      callClaude: vi.fn().mockResolvedValue({ text: '{"score":40,"reason":"Low risk","confidence":"medium"}', inputTokens: 80, outputTokens: 15 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: '{"score":40,"reason":"Low risk","confidence":"medium"}', provider: 'anthropic', model: null, usage: { inputTokens: 80, outputTokens: 15 } }) },
     })
     await runScorer(BASE_PAYLOAD, deps)
 
     expect(deps.sendGroupScored).not.toHaveBeenCalled()
   })
 
-  it('logs token usage after every Claude call', async () => {
+  it('logs token usage after every LLM call', async () => {
     const deps = makeDeps()
     await runScorer(BASE_PAYLOAD, deps)
 
@@ -232,7 +231,7 @@ describe('runScorer', () => {
     expect(deps.updateGroupScore).toHaveBeenCalledWith('grp-001', 82, 'High risk')
   })
 
-  it('skips Claude call and returns cached score when recently scored (not new + score set + fresh window)', async () => {
+  it('skips LLM call and returns cached score when recently scored (not new + score set + fresh window)', async () => {
     const recentWindow = new Date(Date.now() - 30 * 1000).toISOString() // 30s ago
 
     const deps = makeDeps({
@@ -246,7 +245,7 @@ describe('runScorer', () => {
 
     expect(result.skipped).toBe(true)
     expect(result.score).toBe(77)
-    expect(deps.callClaude).not.toHaveBeenCalled()
+    expect(deps.llm.complete).not.toHaveBeenCalled()
   })
 
   it('does NOT skip for new groups even if score exists', async () => {
@@ -261,6 +260,20 @@ describe('runScorer', () => {
     const result = await runScorer({ ...BASE_PAYLOAD, isNew: true }, deps)
 
     expect(result.skipped).toBeUndefined()
-    expect(deps.callClaude).toHaveBeenCalled()
+    expect(deps.llm.complete).toHaveBeenCalled()
+  })
+
+  it('uses rule-based fallback when llm.provider is "fallback"', async () => {
+    const deps = makeDeps({
+      llm: { provider: 'fallback' as const, complete: vi.fn() },
+    })
+
+    const result = await runScorer(BASE_PAYLOAD, deps)
+
+    // CrashLoopBackOff → getRuleBasedScore → 85
+    expect(result.score).toBe(85)
+    expect(result.confidence).toBe('low')
+    expect(deps.llm.complete).not.toHaveBeenCalled()
+    expect(deps.updateGroupScore).toHaveBeenCalledWith('grp-001', 85, expect.stringContaining('Sin LLM'))
   })
 })

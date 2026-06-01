@@ -1,6 +1,7 @@
 import { query } from './client'
 import type { AlertGroup, Service } from '@/types/database'
 import type { NormalizedAlert } from '@/types/events'
+import { encryptSecret } from '@/lib/crypto/secrets'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -206,4 +207,75 @@ export async function saveAlertEvent(
   )
   if (rows.length === 0) throw new Error('Failed to save alert event')
   return rows[0]
+}
+
+// ─── Project settings ──────────────────────────────────────────────────────────
+
+export interface ProjectSettings {
+  llmProvider:        'openai' | 'anthropic' | null
+  llmApiKeyConfigured: boolean
+  llmModel:           string | null
+}
+
+export interface ProjectSettingsPatch {
+  llmProvider?: 'openai' | 'anthropic' | null
+  llmApiKey?:   string | null
+  llmModel?:    string | null
+}
+
+/**
+ * Returns project LLM settings. NEVER returns the raw API key.
+ */
+export async function getProjectSettings(projectId: string): Promise<ProjectSettings | null> {
+  const rows = await query<{
+    llm_provider:          'openai' | 'anthropic' | null
+    llm_api_key_encrypted: Buffer | null
+    llm_model:             string | null
+  }>(
+    'SELECT llm_provider, llm_api_key_encrypted, llm_model FROM project_settings WHERE project_id = $1',
+    [projectId],
+  )
+  if (rows.length === 0) return null
+  const r = rows[0]
+  return {
+    llmProvider:         r.llm_provider,
+    llmApiKeyConfigured: r.llm_api_key_encrypted !== null,
+    llmModel:            r.llm_model,
+  }
+}
+
+/**
+ * Upsert project LLM settings. Encrypts the API key before storing.
+ */
+export async function upsertProjectSettings(
+  projectId: string,
+  patch: ProjectSettingsPatch,
+): Promise<void> {
+  // Ensure row exists
+  await query(
+    'INSERT INTO project_settings (project_id) VALUES ($1) ON CONFLICT (project_id) DO NOTHING',
+    [projectId],
+  )
+
+  const sets: string[] = ['updated_at = now()']
+  const vals: unknown[] = []
+
+  if (patch.llmProvider !== undefined) {
+    sets.push(`llm_provider = $${vals.push(patch.llmProvider)}`)
+  }
+  if (patch.llmApiKey !== undefined) {
+    const encrypted = patch.llmApiKey !== null ? encryptSecret(patch.llmApiKey) : null
+    sets.push(`llm_api_key_encrypted = $${vals.push(encrypted)}`)
+  }
+  if (patch.llmModel !== undefined) {
+    sets.push(`llm_model = $${vals.push(patch.llmModel)}`)
+  }
+
+  if (vals.length === 0) return
+
+  vals.push(projectId)
+  await query(
+    `UPDATE project_settings SET ${sets.join(', ')} WHERE project_id = $${vals.length}`,
+    vals,
+  )
 }

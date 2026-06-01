@@ -1,8 +1,9 @@
 import { getBoss, QUEUE } from '@/lib/queue/boss'
-import { anthropic } from '@/lib/claude/client'
-import { SCORER_SYSTEM_PROMPT } from '@/lib/claude/prompts'
+import { getLLMClient } from '@/lib/llm/factory'
+import { SCORER_SYSTEM_PROMPT } from '@/lib/llm/prompts'
 import { query } from '@/lib/db/client'
 import { getRuleBasedScore } from '@/lib/plans'
+import type { LLMClient } from '@/lib/llm/types'
 import type { GroupEventPayload, GroupScoredPayload } from '@/types/events'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -113,9 +114,8 @@ Evaluate the risk and return the JSON score.`
 // ─── Dependency-injected runner (exported for tests) ─────────────────────────
 
 export interface ScorerDeps {
-  checkAIAccess: (projectId: string) => Promise<boolean>
+  llm: LLMClient
   fetchContext: (groupId: string, projectId: string) => Promise<ScorerContext>
-  callClaude: (userMessage: string) => Promise<{ text: string; inputTokens: number; outputTokens: number }>
   updateGroupScore: (groupId: string, score: number, reason: string) => Promise<void>
   sendGroupScored: (payload: GroupScoredPayload) => Promise<void>
   logTokens: (input: number, output: number) => void
@@ -135,11 +135,10 @@ export async function runScorer(
 ): Promise<ScorerResult> {
   const { groupId, projectId, isNew, count, trend, reason } = payload
 
-  // 0. Plan check: free plan skips Claude, uses rule-based scoring instead
-  const hasAIAccess = await deps.checkAIAccess(projectId)
-  if (!hasAIAccess) {
+  // 0. Fallback: if no LLM is configured, use rule-based scoring.
+  if (deps.llm.provider === 'fallback') {
     const fallbackScore = getRuleBasedScore(reason)
-    await deps.updateGroupScore(groupId, fallbackScore, 'Score calculado con reglas básicas · Plan Team activa IA')
+    await deps.updateGroupScore(groupId, fallbackScore, 'Score calculado con reglas básicas · Sin LLM configurado')
     if (fallbackScore > 50) {
       await deps.sendGroupScored({
         groupId,
@@ -165,15 +164,23 @@ export async function runScorer(
     }
   }
 
-  // 3. Build Claude user message
+  // 3. Build LLM user message
   const userMessage = buildUserMessage(
     { groupId, projectId, isNew, count, trend, reason, flapping: false, frequency: count / 5 },
     ctx
   )
 
-  // 4. Call Claude
-  const { text, inputTokens, outputTokens } = await deps.callClaude(userMessage)
-  deps.logTokens(inputTokens, outputTokens)
+  // 4. Call LLM
+  const result = await deps.llm.complete({
+    messages: [
+      { role: 'system', content: SCORER_SYSTEM_PROMPT },
+      { role: 'user',   content: userMessage },
+    ],
+    maxTokens:      200,
+    responseFormat: 'json',
+  })
+  deps.logTokens(result.usage?.inputTokens ?? 0, result.usage?.outputTokens ?? 0)
+  const { text } = result
 
   // 5. Parse response
   const scored = parseScorerResponse(text, reason)
@@ -241,11 +248,11 @@ export async function runScoring(payload: ScoreJobPayload): Promise<void> {
     }
   }
 
+  const llm = await getLLMClient(projectId)
   await runScorer(
     { groupId, projectId, isNew, count, trend, reason, flapping, frequency },
     {
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      checkAIAccess: async (_pid: string) => !!process.env.ANTHROPIC_API_KEY,
+      llm,
 
       fetchContext: async (gId, pId) => {
         const ago30min = new Date(Date.now() - 30 * 60 * 1000).toISOString()
@@ -282,21 +289,6 @@ export async function runScoring(payload: ScoreJobPayload): Promise<void> {
           services:        services as ScorerContext['services'],
           recentIncidents: incidents as ScorerContext['recentIncidents'],
           recentDeploys:   deploys as ScorerContext['recentDeploys'],
-        }
-      },
-
-      callClaude: async (userMessage) => {
-        const response = await anthropic.messages.create({
-          model:      'claude-haiku-4-5-20251001',
-          max_tokens: 200,
-          system:     SCORER_SYSTEM_PROMPT,
-          messages:   [{ role: 'user', content: userMessage }],
-        })
-        const block = response.content[0]
-        return {
-          text:         block.type === 'text' ? block.text : '',
-          inputTokens:  response.usage.input_tokens,
-          outputTokens: response.usage.output_tokens,
         }
       },
 

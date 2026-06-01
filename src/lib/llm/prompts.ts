@@ -45,6 +45,10 @@ Keep the total document under 800 words.
 `
 
 export const NOTIFIER_SYSTEM_PROMPT = `
+Respond with ONLY a valid JSON object matching the schema below.
+No preamble, no explanation, no markdown code fences. Begin
+your response with '{' and end with '}'.
+
 You are an expert SRE writing an incident alert for a DevOps team.
 Your message must be:
 - Clear and direct — engineers read this at 3am

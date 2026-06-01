@@ -1,7 +1,9 @@
 import { getBoss, QUEUE } from '@/lib/queue/boss'
-import { anthropic } from '@/lib/claude/client'
-import { CORRELATOR_SYSTEM_PROMPT } from '@/lib/claude/prompts'
+import { getLLMClient } from '@/lib/llm/factory'
+import { CORRELATOR_SYSTEM_PROMPT } from '@/lib/llm/prompts'
 import { query } from '@/lib/db/client'
+import { FALLBACK_CORRELATION } from '@/lib/llm/fallback'
+import type { LLMClient } from '@/lib/llm/types'
 import type { GroupScoredPayload, GroupCriticalPayload } from '@/types/events'
 import type { CorrelateJobPayload } from '@/agents/scorer'
 import type { NotifyJobPayload } from '@/agents/notifier'
@@ -47,7 +49,7 @@ export interface CorrelatorDeps {
   fetchCurrentGroup: (groupId: string) => Promise<RelatedGroupData | null>
   fetchRelatedGroups: (projectId: string, currentGroupId: string) => Promise<RelatedGroupData[]>
   fetchServicesForIds: (ids: string[]) => Promise<ServiceInfo[]>
-  callClaude: (prompt: string) => Promise<{ text: string; inputTokens: number; outputTokens: number }>
+  llm: LLMClient
   updateGroupCorrelated: (groupId: string, score: number, rootCause: string) => Promise<void>
   sendGroupCritical: (payload: GroupCriticalPayload) => Promise<void>
   logTokens: (input: number, output: number) => void
@@ -70,7 +72,7 @@ export function shouldSkipCorrelation(group: {
 }
 
 /**
- * Builds the Claude prompt for correlating multiple alert groups.
+ * Builds the LLM prompt for correlating multiple alert groups.
  */
 export function buildCorrelationPrompt(
   current: {
@@ -119,7 +121,7 @@ If not correlated, set correlated=false and combined_score equal to the highest 
 }
 
 /**
- * Safely parses Claude's correlation JSON response.
+ * Safely parses the LLM correlation JSON response.
  * Falls back to non-correlated result on any parse error.
  */
 export function parseCorrelationResponse(
@@ -201,7 +203,7 @@ export async function runCorrelator(
   const serviceMap   = new Map(services.map((s) => [s.id, s]))
   const currentNames = serviceIds.map((id) => serviceMap.get(id)?.name ?? id)
 
-  // 6. No related groups → bypass Claude, check threshold directly
+  // 6. No related groups → bypass LLM, check threshold directly
   if (relatedGroups.length === 0) {
     if (score > 70) {
       await deps.sendGroupCritical({
@@ -219,7 +221,7 @@ export async function runCorrelator(
     return { groupId, finalScore: score, correlated: false }
   }
 
-  // 7. Build Claude prompt with all groups in context
+  // 7. Build LLM prompt with all groups in context
   const relatedForPrompt = relatedGroups.map((g) => ({
     description:  g.score_reason,
     score:        g.score,
@@ -232,9 +234,24 @@ export async function runCorrelator(
     relatedForPrompt
   )
 
-  // 8. Call Claude Haiku
-  const { text, inputTokens, outputTokens } = await deps.callClaude(prompt)
-  deps.logTokens(inputTokens, outputTokens)
+  // 8. Call LLM (or use deterministic fallback)
+  let text: string
+  if (deps.llm.provider === 'fallback') {
+    // No LLM configured — use deterministic no-correlation result.
+    text = FALLBACK_CORRELATION
+    deps.logTokens(0, 0)
+  } else {
+    const result = await deps.llm.complete({
+      messages: [
+        { role: 'system', content: CORRELATOR_SYSTEM_PROMPT },
+        { role: 'user',   content: prompt },
+      ],
+      maxTokens:      300,
+      responseFormat: 'json',
+    })
+    deps.logTokens(result.usage?.inputTokens ?? 0, result.usage?.outputTokens ?? 0)
+    text = result.text
+  }
 
   // 9. Parse response
   const correlation = parseCorrelationResponse(text, { score, reason })
@@ -296,9 +313,12 @@ export async function runCorrelation(payload: CorrelateJobPayload): Promise<void
     return
   }
 
+  const llm = await getLLMClient(projectId)
   await runCorrelator(
     { groupId, projectId, score, reason, confidence: payload.confidence, serviceIds },
     {
+      llm,
+
       fetchCurrentGroup: async (gId) => {
         const r = await query<RelatedGroupData>(
           'SELECT id, event_ids, service_ids, score, score_reason, correlated, window_end FROM alert_groups WHERE id = $1',
@@ -325,21 +345,6 @@ export async function runCorrelation(payload: CorrelateJobPayload): Promise<void
           'SELECT id, name, criticality, source FROM services WHERE id = ANY($1::uuid[])',
           [ids],
         )
-      },
-
-      callClaude: async (prompt) => {
-        const response = await anthropic.messages.create({
-          model:      'claude-haiku-4-5-20251001',
-          max_tokens: 300,
-          system:     CORRELATOR_SYSTEM_PROMPT,
-          messages:   [{ role: 'user', content: prompt }],
-        })
-        const block = response.content[0]
-        return {
-          text:         block.type === 'text' ? block.text : '',
-          inputTokens:  response.usage.input_tokens,
-          outputTokens: response.usage.output_tokens,
-        }
       },
 
       updateGroupCorrelated: async (gId, finalScore, rootCause) => {

@@ -181,7 +181,7 @@ function makeDeps(overrides: Partial<CorrelatorDeps> = {}): CorrelatorDeps {
     fetchCurrentGroup:    vi.fn().mockResolvedValue(BASE_GROUP),
     fetchRelatedGroups:   vi.fn().mockResolvedValue([]),
     fetchServicesForIds:  vi.fn().mockResolvedValue([{ id: 'svc-1', name: 'api', criticality: 8, source: 'kubernetes' }]),
-    callClaude:           vi.fn().mockResolvedValue({ text: NOT_CORRELATED_JSON, inputTokens: 200, outputTokens: 50 }),
+    llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: NOT_CORRELATED_JSON, provider: 'anthropic', model: null, usage: { inputTokens: 200, outputTokens: 50 } }) },
     updateGroupCorrelated: vi.fn().mockResolvedValue(undefined),
     sendGroupCritical:    vi.fn().mockResolvedValue(undefined),
     logTokens:            vi.fn(),
@@ -208,7 +208,7 @@ describe('runCorrelator', () => {
     const result = await runCorrelator(BASE_PAYLOAD, deps)
     expect(result.skipped).toBe(true)
     expect(result.skipReason).toBe('already correlated')
-    expect(deps.callClaude).not.toHaveBeenCalled()
+    expect(deps.llm.complete).not.toHaveBeenCalled()
   })
 
   // ── Single group (no related) ─────────────────────────────────────────────
@@ -217,7 +217,7 @@ describe('runCorrelator', () => {
     const deps = makeDeps({ fetchRelatedGroups: vi.fn().mockResolvedValue([]) })
     await runCorrelator(BASE_PAYLOAD, deps) // score 82 > 70
 
-    expect(deps.callClaude).not.toHaveBeenCalled()
+    expect(deps.llm.complete).not.toHaveBeenCalled()
     expect(deps.sendGroupCritical).toHaveBeenCalledOnce()
     expect(deps.sendGroupCritical).toHaveBeenCalledWith(
       expect.objectContaining({ groupId: 'grp-001', finalScore: 82, correlated: false })
@@ -228,40 +228,43 @@ describe('runCorrelator', () => {
     const deps = makeDeps({ fetchRelatedGroups: vi.fn().mockResolvedValue([]) })
     await runCorrelator({ ...BASE_PAYLOAD, score: 55 }, deps)
 
-    expect(deps.callClaude).not.toHaveBeenCalled()
+    expect(deps.llm.complete).not.toHaveBeenCalled()
     expect(deps.sendGroupCritical).not.toHaveBeenCalled()
   })
 
-  // ── Related groups — Claude called ───────────────────────────────────────
+  // ── Related groups — LLM called ───────────────────────────────────────────
 
-  it('calls Claude when related groups exist', async () => {
+  it('calls LLM when related groups exist', async () => {
     const deps = makeDeps({
       fetchRelatedGroups: vi.fn().mockResolvedValue([makeRelatedGroup()]),
     })
     await runCorrelator(BASE_PAYLOAD, deps)
-    expect(deps.callClaude).toHaveBeenCalledOnce()
+    expect(deps.llm.complete).toHaveBeenCalledOnce()
   })
 
   it('builds prompt including both current and related group context', async () => {
     let capturedPrompt = ''
     const deps = makeDeps({
       fetchRelatedGroups:  vi.fn().mockResolvedValue([makeRelatedGroup()]),
-      callClaude: vi.fn().mockImplementation(async (prompt: string) => {
-        capturedPrompt = prompt
-        return { text: NOT_CORRELATED_JSON, inputTokens: 200, outputTokens: 50 }
-      }),
+      llm: {
+        provider: 'anthropic' as const,
+        complete: vi.fn().mockImplementation(async (opts) => {
+          capturedPrompt = opts.messages.find((m: { role: string }) => m.role === 'user')?.content ?? ''
+          return { text: NOT_CORRELATED_JSON, provider: 'anthropic', model: null, usage: { inputTokens: 200, outputTokens: 50 } }
+        }),
+      },
     })
     await runCorrelator(BASE_PAYLOAD, deps)
     expect(capturedPrompt).toContain('CrashLoopBackOff') // current reason
     expect(capturedPrompt).toContain('Memory pressure')  // related score_reason
   })
 
-  // ── Claude returns correlated=true ───────────────────────────────────────
+  // ── LLM returns correlated=true ───────────────────────────────────────────
 
-  it('updates group score when Claude returns correlated=true', async () => {
+  it('updates group score when LLM returns correlated=true', async () => {
     const deps = makeDeps({
       fetchRelatedGroups: vi.fn().mockResolvedValue([makeRelatedGroup()]),
-      callClaude:         vi.fn().mockResolvedValue({ text: CORRELATED_JSON, inputTokens: 200, outputTokens: 50 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: CORRELATED_JSON, provider: 'anthropic', model: null, usage: { inputTokens: 200, outputTokens: 50 } }) },
     })
     const result = await runCorrelator(BASE_PAYLOAD, deps)
 
@@ -273,7 +276,7 @@ describe('runCorrelator', () => {
   it('sends group.critical with combined_score when correlated and score > 70', async () => {
     const deps = makeDeps({
       fetchRelatedGroups: vi.fn().mockResolvedValue([makeRelatedGroup()]),
-      callClaude:         vi.fn().mockResolvedValue({ text: CORRELATED_JSON, inputTokens: 200, outputTokens: 50 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: CORRELATED_JSON, provider: 'anthropic', model: null, usage: { inputTokens: 200, outputTokens: 50 } }) },
     })
     await runCorrelator(BASE_PAYLOAD, deps)
 
@@ -283,12 +286,12 @@ describe('runCorrelator', () => {
     )
   })
 
-  // ── Claude returns correlated=false ──────────────────────────────────────
+  // ── LLM returns correlated=false ──────────────────────────────────────────
 
-  it('uses original score when Claude returns correlated=false', async () => {
+  it('uses original score when LLM returns correlated=false', async () => {
     const deps = makeDeps({
       fetchRelatedGroups: vi.fn().mockResolvedValue([makeRelatedGroup()]),
-      callClaude:         vi.fn().mockResolvedValue({ text: NOT_CORRELATED_JSON, inputTokens: 200, outputTokens: 50 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: NOT_CORRELATED_JSON, provider: 'anthropic', model: null, usage: { inputTokens: 200, outputTokens: 50 } }) },
     })
     const result = await runCorrelator(BASE_PAYLOAD, deps)
 
@@ -299,10 +302,10 @@ describe('runCorrelator', () => {
 
   // ── Fallback / resilience ─────────────────────────────────────────────────
 
-  it('uses fallback when Claude returns invalid JSON — no crash', async () => {
+  it('uses fallback when LLM returns invalid JSON — no crash', async () => {
     const deps = makeDeps({
       fetchRelatedGroups: vi.fn().mockResolvedValue([makeRelatedGroup()]),
-      callClaude:         vi.fn().mockResolvedValue({ text: 'not valid json', inputTokens: 100, outputTokens: 20 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: 'not valid json', provider: 'anthropic', model: null, usage: { inputTokens: 100, outputTokens: 20 } }) },
     })
     const result = await runCorrelator(BASE_PAYLOAD, deps)
     expect(result.finalScore).toBe(82)  // falls back to original score
@@ -318,7 +321,7 @@ describe('runCorrelator', () => {
     })
     const deps = makeDeps({
       fetchRelatedGroups: vi.fn().mockResolvedValue([makeRelatedGroup()]),
-      callClaude:         vi.fn().mockResolvedValue({ text: lowCombined, inputTokens: 200, outputTokens: 40 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: lowCombined, provider: 'anthropic', model: null, usage: { inputTokens: 200, outputTokens: 40 } }) },
     })
     await runCorrelator(BASE_PAYLOAD, deps)
     expect(deps.sendGroupCritical).not.toHaveBeenCalled()
@@ -326,10 +329,10 @@ describe('runCorrelator', () => {
 
   // ── Token logging ─────────────────────────────────────────────────────────
 
-  it('logs token usage after each Claude call', async () => {
+  it('logs token usage after each LLM call', async () => {
     const deps = makeDeps({
       fetchRelatedGroups: vi.fn().mockResolvedValue([makeRelatedGroup()]),
-      callClaude:         vi.fn().mockResolvedValue({ text: NOT_CORRELATED_JSON, inputTokens: 220, outputTokens: 55 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: NOT_CORRELATED_JSON, provider: 'anthropic', model: null, usage: { inputTokens: 220, outputTokens: 55 } }) },
     })
     await runCorrelator(BASE_PAYLOAD, deps)
     expect(deps.logTokens).toHaveBeenCalledWith(220, 55)

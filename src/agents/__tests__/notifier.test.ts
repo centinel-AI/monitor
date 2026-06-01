@@ -244,7 +244,7 @@ const BASE_CONTEXT: NotifierContext = {
   ownerEmail:    'test@centinelai.io',
 }
 
-const VALID_CLAUDE_RESPONSE = JSON.stringify({
+const VALID_LLM_RESPONSE = JSON.stringify({
   summary:      'API pods OOMKilled in production',
   impact:       '2 replicas down, high error rate',
   likely_cause: 'Memory leak introduced in v2.3.1',
@@ -254,7 +254,7 @@ const VALID_CLAUDE_RESPONSE = JSON.stringify({
 function makeDeps(overrides: Partial<NotifierDeps> = {}): NotifierDeps {
   return {
     fetchContext:      vi.fn().mockResolvedValue(BASE_CONTEXT),
-    callClaude:        vi.fn().mockResolvedValue({ text: VALID_CLAUDE_RESPONSE, inputTokens: 300, outputTokens: 80 }),
+    llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: VALID_LLM_RESPONSE, provider: 'anthropic', model: null, usage: { inputTokens: 300, outputTokens: 80 } }) },
     sendSlack:         vi.fn().mockResolvedValue(undefined),
     markGroupNotified: vi.fn().mockResolvedValue(undefined),
     logTokens:         vi.fn(),
@@ -273,7 +273,7 @@ describe('runNotifier', () => {
     const result = await runNotifier(BASE_PAYLOAD, deps)
     expect(result.skipped).toBe(true)
     expect(result.skipReason).toBe('already notified')
-    expect(deps.callClaude).not.toHaveBeenCalled()
+    expect(deps.llm.complete).not.toHaveBeenCalled()
     expect(deps.sendSlack).not.toHaveBeenCalled()
   })
 
@@ -287,7 +287,7 @@ describe('runNotifier', () => {
     const result = await runNotifier(BASE_PAYLOAD, deps)
     expect(result.skipped).toBe(true)
     expect(result.skipReason).toBe('snoozed')
-    expect(deps.callClaude).not.toHaveBeenCalled()
+    expect(deps.llm.complete).not.toHaveBeenCalled()
   })
 
   it('skips and marks notified when no Slack channel configured', async () => {
@@ -312,10 +312,10 @@ describe('runNotifier', () => {
 
   // ── Happy path ────────────────────────────────────────────────────────────
 
-  it('calls Claude and sends Slack when all conditions met', async () => {
+  it('calls LLM and sends Slack when all conditions met', async () => {
     const deps   = makeDeps()
     const result = await runNotifier(BASE_PAYLOAD, deps)
-    expect(deps.callClaude).toHaveBeenCalledOnce()
+    expect(deps.llm.complete).toHaveBeenCalledOnce()
     expect(deps.sendSlack).toHaveBeenCalledOnce()
     expect(result.notified).toBe(true)
     expect(result.channel).toBe('#alerts')
@@ -350,11 +350,11 @@ describe('runNotifier', () => {
     expect(deps.logTokens).toHaveBeenCalledWith(300, 80)
   })
 
-  // ── Claude fallback ───────────────────────────────────────────────────────
+  // ── LLM fallback ─────────────────────────────────────────────────────────
 
-  it('uses fallback when Claude returns invalid JSON — still sends Slack', async () => {
+  it('uses fallback when LLM returns invalid JSON — still sends Slack', async () => {
     const deps = makeDeps({
-      callClaude: vi.fn().mockResolvedValue({ text: 'not valid json', inputTokens: 100, outputTokens: 20 }),
+      llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: 'not valid json', provider: 'anthropic', model: null, usage: { inputTokens: 100, outputTokens: 20 } }) },
     })
     const result = await runNotifier(BASE_PAYLOAD, deps)
     expect(result.notified).toBe(true)

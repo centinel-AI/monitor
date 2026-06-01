@@ -1,8 +1,9 @@
-import { anthropic } from '@/lib/claude/client'
-import { NOTIFIER_SYSTEM_PROMPT } from '@/lib/claude/prompts'
+import { getLLMClient } from '@/lib/llm/factory'
+import { NOTIFIER_SYSTEM_PROMPT } from '@/lib/llm/prompts'
 import { query } from '@/lib/db/client'
 import { getSlackConfigForProject } from '@/lib/slack/client'
 import { getScoreLabel } from '@/lib/dashboard-stats'
+import type { LLMClient } from '@/lib/llm/types'
 import type { GroupCriticalPayload } from '@/types/events'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -50,7 +51,7 @@ export interface NotifierContext {
 
 export interface NotifierDeps {
   fetchContext: (groupId: string, projectId: string, affectedServiceIds: string[]) => Promise<NotifierContext>
-  callClaude: (context: string) => Promise<{ text: string; inputTokens: number; outputTokens: number }>
+  llm: LLMClient
   sendSlack: (channel: string, blocks: unknown[], fallbackText: string) => Promise<void>
   markGroupNotified: (groupId: string) => Promise<void>
   logTokens: (input: number, output: number) => void
@@ -58,8 +59,17 @@ export interface NotifierDeps {
 
 // ─── Pure logic (exported for unit tests) ────────────────────────────────────
 
+function buildFallbackNotification({ rootCause, serviceCount }: { rootCause: string; serviceCount: number }): NotifierParsed {
+  return {
+    summary:      rootCause.slice(0, 80),
+    impact:       `${serviceCount} service(s) affected`,
+    likely_cause: 'No LLM configured; deterministic notification.',
+    actions:      ['Configure LLM provider in project settings to enable AI-powered notifications.'],
+  }
+}
+
 /**
- * Safely parses Claude's notifier JSON response.
+ * Safely parses the LLM notifier JSON response.
  * Falls back to a minimal message on any parse error.
  */
 export function parseNotifierResponse(
@@ -98,7 +108,7 @@ export function parseNotifierResponse(
 }
 
 /**
- * Builds the Claude context string from the alert payload and fetched data.
+ * Builds the LLM context string from the alert payload and fetched data.
  */
 export function buildNotifierContext(
   payload: GroupCriticalPayload,
@@ -238,15 +248,35 @@ export async function runNotifier(
     return { groupId, notified: false, skipped: true, skipReason: 'no slack channel or token' }
   }
 
-  // 5. Build Claude context string
+  // 5. Build LLM context string
   const contextStr = buildNotifierContext(
     { groupId, projectId, finalScore, rootCause, affectedServices, correlated, relatedGroupIds },
     ctx
   )
 
-  // 6. Call Claude Sonnet
-  const { text, inputTokens, outputTokens } = await deps.callClaude(contextStr)
-  deps.logTokens(inputTokens, outputTokens)
+  // 6. Call LLM — or use deterministic fallback if no provider is configured.
+  if (deps.llm.provider === 'fallback') {
+    const parsed      = buildFallbackNotification({ rootCause, serviceCount: ctx.services.length })
+    const serviceNames = ctx.services.map((s) => s.name)
+    const blocks       = buildSlackBlocks(payload, parsed, serviceNames)
+    const scoreEmoji   = finalScore >= 90 ? '🔴' : finalScore >= 70 ? '🟠' : '🟡'
+    const scoreLabel   = finalScore >= 90 ? 'CRITICAL' : finalScore >= 70 ? 'HIGH' : 'MEDIUM'
+    await deps.sendSlack(ctx.slackChannel, blocks, `${scoreEmoji} ${scoreLabel}: ${parsed.summary}`)
+    await deps.markGroupNotified(groupId)
+    console.log(`[notifier] Fallback notif: group ${groupId} → #${ctx.slackChannel}`)
+    return { groupId, notified: true, channel: ctx.slackChannel }
+  }
+
+  const result = await deps.llm.complete({
+    messages: [
+      { role: 'system', content: NOTIFIER_SYSTEM_PROMPT },
+      { role: 'user',   content: contextStr },
+    ],
+    maxTokens:      500,
+    responseFormat: 'json',
+  })
+  deps.logTokens(result.usage?.inputTokens ?? 0, result.usage?.outputTokens ?? 0)
+  const { text } = result
 
   // 7. Parse response (with fallback)
   const parsed = parseNotifierResponse(text, {
@@ -307,9 +337,12 @@ export async function runNotify(payload: NotifyJobPayload): Promise<void> {
     return
   }
 
+  const llm = await getLLMClient(projectId)
   await runNotifier(
     { groupId, projectId, finalScore, rootCause, affectedServices, correlated, relatedGroupIds },
     {
+      llm,
+
       fetchContext: async (gId, pId, affectedSvcIds) => {
         const [groupRow, slackCfg, ownerRow] = await Promise.all([
           query<{ id: string; notified: boolean; snoozed_until: string | null; event_ids: string[] }>(
@@ -343,21 +376,6 @@ export async function runNotify(payload: NotifyJobPayload): Promise<void> {
           slackBotToken: slackCfg?.botToken ?? null,
           ownerEmail:    ownerRow?.email ?? null,
         } as NotifierContext
-      },
-
-      callClaude: async (contextStr) => {
-        const response = await anthropic.messages.create({
-          model:      'claude-sonnet-4-5',
-          max_tokens: 500,
-          system:     NOTIFIER_SYSTEM_PROMPT,
-          messages:   [{ role: 'user', content: contextStr }],
-        })
-        const block = response.content[0]
-        return {
-          text:         block.type === 'text' ? block.text : '',
-          inputTokens:  response.usage.input_tokens,
-          outputTokens: response.usage.output_tokens,
-        }
       },
 
       sendSlack: async (channel, blocks, fallbackText) => {
