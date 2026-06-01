@@ -13,9 +13,6 @@ export type Database = {
         Row: {
           id: string
           name: string
-          slug: string
-          plan: 'free' | 'team' | 'pro'
-          stripe_id: string | null
           api_token: string
           onboarding_completed: boolean
           created_at: string
@@ -24,9 +21,6 @@ export type Database = {
         Insert: {
           id?: string
           name: string
-          slug: string
-          plan?: 'free' | 'team' | 'pro'
-          stripe_id?: string | null
           api_token?: string
           onboarding_completed?: boolean
           created_at?: string
@@ -35,40 +29,10 @@ export type Database = {
         Update: {
           id?: string
           name?: string
-          slug?: string
-          plan?: 'free' | 'team' | 'pro'
-          stripe_id?: string | null
           api_token?: string
           onboarding_completed?: boolean
           created_at?: string
           updated_at?: string
-        }
-        Relationships: []
-      }
-      users: {
-        Row: {
-          id: string
-          project_id: string
-          email: string
-          full_name: string | null
-          role: 'owner' | 'admin' | 'member'
-          created_at: string
-        }
-        Insert: {
-          id: string
-          project_id: string
-          email: string
-          full_name?: string | null
-          role?: 'owner' | 'admin' | 'member'
-          created_at?: string
-        }
-        Update: {
-          id?: string
-          project_id?: string
-          email?: string
-          full_name?: string | null
-          role?: 'owner' | 'admin' | 'member'
-          created_at?: string
         }
         Relationships: []
       }
@@ -276,7 +240,6 @@ export type Database = {
           embedding: number[] | null
           started_at: string
           resolved_at: string | null
-          created_by: string | null
         }
         Insert: {
           id?: string
@@ -289,7 +252,6 @@ export type Database = {
           embedding?: number[] | null
           started_at?: string
           resolved_at?: string | null
-          created_by?: string | null
         }
         Update: {
           id?: string
@@ -302,7 +264,6 @@ export type Database = {
           embedding?: number[] | null
           started_at?: string
           resolved_at?: string | null
-          created_by?: string | null
         }
         Relationships: []
       }
@@ -312,7 +273,6 @@ export type Database = {
           project_id: string
           group_id: string
           expires_at: string
-          created_by: string | null
           created_at: string
         }
         Insert: {
@@ -320,7 +280,6 @@ export type Database = {
           project_id: string
           group_id: string
           expires_at: string
-          created_by?: string | null
           created_at?: string
         }
         Update: {
@@ -328,7 +287,6 @@ export type Database = {
           project_id?: string
           group_id?: string
           expires_at?: string
-          created_by?: string | null
           created_at?: string
         }
         Relationships: []
@@ -352,10 +310,6 @@ type Tables = Database['public']['Tables']
 export type Project       = Tables['projects']['Row']
 export type ProjectInsert = Tables['projects']['Insert']
 export type ProjectUpdate = Tables['projects']['Update']
-
-export type User           = Tables['users']['Row']
-export type UserInsert     = Tables['users']['Insert']
-export type UserUpdate     = Tables['users']['Update']
 
 export type Service        = Tables['services']['Row']
 export type ServiceInsert  = Tables['services']['Insert']
@@ -387,8 +341,6 @@ export type SnoozedGroupUpdate = Tables['snoozed_groups']['Update']
 
 // ─── Domain enums ─────────────────────────────────────────────────────────────
 
-export type ProjectPlan      = Project['plan']
-export type UserRole         = User['role']
 export type ServiceSource    = Service['source']
 export type ConnectorType    = Connector['type']
 export type DeployStatus     = NonNullable<Deploy['status']>

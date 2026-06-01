@@ -34,17 +34,6 @@ export async function POST(
   const { id } = await params
   const project_id = await getProjectId()
 
-  // Plan gate: postmortem generation requires Team or Pro
-  const orgRows = await query<{ plan: string }>('SELECT plan FROM projects WHERE id = $1', [project_id])
-  const org = orgRows[0] ?? null
-
-  if (org?.plan === 'free' || !org?.plan) {
-    return NextResponse.json({
-      error:   'upgrade_required',
-      message: 'El postmortem con IA requiere el plan Team o Pro.',
-    }, { status: 403 })
-  }
-
   const incidentRows = await query<{ id: string; project_id: string; status: string; postmortem: string | null }>(
     'SELECT id, project_id, status, postmortem FROM incidents WHERE id = $1 AND project_id = $2',
     [id, project_id],

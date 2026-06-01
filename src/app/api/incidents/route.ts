@@ -16,10 +16,10 @@ export async function POST(request: NextRequest) {
   }
 
   const incidentRows = await query<Record<string, unknown>>(
-    `INSERT INTO incidents (project_id, title, severity, status, started_at, created_by)
-     VALUES ($1, $2, $3, 'open', $4, $5)
+    `INSERT INTO incidents (project_id, title, severity, status, started_at)
+     VALUES ($1, $2, $3, 'open', $4)
      RETURNING *`,
-    [project_id, body.title.trim(), body.severity, new Date().toISOString(), null],
+    [project_id, body.title.trim(), body.severity, new Date().toISOString()],
   )
   const incident = incidentRows[0]
 

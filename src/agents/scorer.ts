@@ -2,7 +2,7 @@ import { getBoss, QUEUE } from '@/lib/queue/boss'
 import { getLLMClient } from '@/lib/llm/factory'
 import { SCORER_SYSTEM_PROMPT } from '@/lib/llm/prompts'
 import { query } from '@/lib/db/client'
-import { getRuleBasedScore } from '@/lib/plans'
+import { getRuleBasedScore } from '@/lib/scoring/rules'
 import type { LLMClient } from '@/lib/llm/types'
 import type { GroupEventPayload, GroupScoredPayload } from '@/types/events'
 
