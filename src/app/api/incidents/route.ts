@@ -1,17 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAuth } from '@/lib/auth'
+import { getProjectId } from '@/lib/auth/context'
 import { query } from '@/lib/db/client'
 
 export async function POST(request: NextRequest) {
-  const user = await requireAuth()
-
-  const profileRows = await query<{ project_id: string }>(
-    'SELECT project_id FROM users WHERE id = $1',
-    [user.id],
-  )
-  const profile = profileRows[0] ?? null
-
-  if (!profile?.project_id) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+  const project_id = await getProjectId()
 
   const body = await request.json() as {
     title: string
@@ -27,7 +19,7 @@ export async function POST(request: NextRequest) {
     `INSERT INTO incidents (project_id, title, severity, status, started_at, created_by)
      VALUES ($1, $2, $3, 'open', $4, $5)
      RETURNING *`,
-    [profile.project_id, body.title.trim(), body.severity, new Date().toISOString(), user.id],
+    [project_id, body.title.trim(), body.severity, new Date().toISOString(), null],
   )
   const incident = incidentRows[0]
 

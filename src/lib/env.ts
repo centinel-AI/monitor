@@ -2,6 +2,7 @@ const requiredEnvVars = [
   'MONITOR_POSTGRES_URL',
   'MASTER_ENCRYPTION_KEY',
   'NEXT_PUBLIC_APP_URL',
+  'MONITOR_SERVICE_TOKEN',
 ] as const
 
 export const optionalEnvVars = [

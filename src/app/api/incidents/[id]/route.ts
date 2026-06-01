@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAuth } from '@/lib/auth'
+import { getProjectId } from '@/lib/auth/context'
 import { query } from '@/lib/db/client'
 
 export async function PATCH(
@@ -7,15 +7,7 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params
-  const user = await requireAuth()
-
-  const profileRows = await query<{ project_id: string }>(
-    'SELECT project_id FROM users WHERE id = $1',
-    [user.id],
-  )
-  const profile = profileRows[0] ?? null
-
-  if (!profile?.project_id) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+  const project_id = await getProjectId()
 
   const body = await request.json() as { status?: string }
 
@@ -41,7 +33,7 @@ export async function PATCH(
     return NextResponse.json({ error: 'No valid fields to update' }, { status: 400 })
   }
 
-  vals.push(id, profile.project_id)
+  vals.push(id, project_id)
   const incidentRows = await query<Record<string, unknown>>(
     `UPDATE incidents SET ${sets.join(', ')} WHERE id = $${vals.length - 1} AND project_id = $${vals.length} RETURNING *`,
     vals,

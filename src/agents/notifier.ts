@@ -46,7 +46,6 @@ export interface NotifierContext {
   }>
   slackChannel:  string | null
   slackBotToken: string | null
-  ownerEmail:    string | null
 }
 
 export interface NotifierDeps {
@@ -54,6 +53,7 @@ export interface NotifierDeps {
   llm: LLMClient
   sendSlack: (channel: string, blocks: unknown[], fallbackText: string) => Promise<void>
   markGroupNotified: (groupId: string) => Promise<void>
+  markGroupFailed: (groupId: string, error: string) => Promise<void>
   logTokens: (input: number, output: number) => void
 }
 
@@ -241,10 +241,16 @@ export async function runNotifier(
     return { groupId, notified: false, skipped: true, skipReason: 'snoozed' }
   }
 
-  // 4. Mark notified regardless of Slack config (prevent future re-attempts)
+  // 4. No Slack configured → mark as failed (not retried) and exit.
   if (!ctx.slackChannel || !ctx.slackBotToken) {
-    console.warn(`[notifier] No Slack config for project ${projectId} — skipping notification`)
-    await deps.markGroupNotified(groupId)
+    // TODO M.3: email fallback. Eliminado en M.2.e porque la tabla
+    // `users` con emails de owner desaparece al retirar Supabase Auth.
+    // Cuando el portal Grauss exponga contactos por proyecto:
+    //   - obtener email del owner vía endpoint del portal
+    //   - si Slack no configurado y email existe, enviar email
+    //   - actualmente el notifier es Slack-only
+    console.log(`[notifier] No Slack configured for project ${projectId}, skipping notification (email fallback removed in M.2.e — see TODO)`)
+    await deps.markGroupFailed(groupId, 'No notification channel configured')
     return { groupId, notified: false, skipped: true, skipReason: 'no slack channel or token' }
   }
 
@@ -344,16 +350,16 @@ export async function runNotify(payload: NotifyJobPayload): Promise<void> {
       llm,
 
       fetchContext: async (gId, pId, affectedSvcIds) => {
-        const [groupRow, slackCfg, ownerRow] = await Promise.all([
+        const [groupRow, slackCfg] = await Promise.all([
           query<{ id: string; notified: boolean; snoozed_until: string | null; event_ids: string[] }>(
             'SELECT id, notified, snoozed_until, event_ids FROM alert_groups WHERE id = $1',
             [gId],
           ).then(r => r[0] ?? null),
           getSlackConfigForProject(pId),
-          query<{ email: string }>(
-            'SELECT email FROM users WHERE project_id = $1 AND role = $2 LIMIT 1',
-            [pId, 'owner'],
-          ).then(r => r[0] ?? null),
+          // TODO M.3: email fallback. Eliminado en M.2.e porque la tabla
+          // `users` con emails de owner desaparece al retirar Supabase Auth.
+          // Cuando el portal Grauss exponga contactos por proyecto, añadir aquí
+          // la consulta al endpoint del portal para obtener email de contacto.
         ])
         if (!groupRow) throw new Error(`Group ${gId} not found`)
         const [servicesResult, eventsResult] = await Promise.all([
@@ -374,7 +380,6 @@ export async function runNotify(payload: NotifyJobPayload): Promise<void> {
           recentEvents:  eventsResult as NotifierContext['recentEvents'],
           slackChannel:  slackCfg?.channel  ?? null,
           slackBotToken: slackCfg?.botToken ?? null,
-          ownerEmail:    ownerRow?.email ?? null,
         } as NotifierContext
       },
 
@@ -396,6 +401,13 @@ export async function runNotify(payload: NotifyJobPayload): Promise<void> {
         await query(
           'UPDATE alert_groups SET notified = true, notified_at = now() WHERE id = $1',
           [gId],
+        )
+      },
+
+      markGroupFailed: async (gId, error) => {
+        await query(
+          'UPDATE alert_groups SET failed_at = now(), last_error = $1 WHERE id = $2',
+          [error, gId],
         )
       },
 

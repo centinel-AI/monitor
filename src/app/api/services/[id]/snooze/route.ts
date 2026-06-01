@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAuth, getProjectId } from '@/lib/auth'
+import { getProjectId } from '@/lib/auth/context'
 import { query } from '@/lib/db/client'
 
 export async function POST(
@@ -7,11 +7,7 @@ export async function POST(
   { params }: { params: { id: string } }
 ) {
   try {
-    await requireAuth()
     const projectId = await getProjectId()
-    if (!projectId) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
 
     const serviceId = params.id
 

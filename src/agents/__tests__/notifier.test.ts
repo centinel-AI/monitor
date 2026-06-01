@@ -241,7 +241,6 @@ const BASE_CONTEXT: NotifierContext = {
   ],
   slackChannel:  '#alerts',
   slackBotToken: 'xoxb-test-token',
-  ownerEmail:    'test@centinelai.io',
 }
 
 const VALID_LLM_RESPONSE = JSON.stringify({
@@ -257,6 +256,7 @@ function makeDeps(overrides: Partial<NotifierDeps> = {}): NotifierDeps {
     llm: { provider: 'anthropic' as const, complete: vi.fn().mockResolvedValue({ text: VALID_LLM_RESPONSE, provider: 'anthropic', model: null, usage: { inputTokens: 300, outputTokens: 80 } }) },
     sendSlack:         vi.fn().mockResolvedValue(undefined),
     markGroupNotified: vi.fn().mockResolvedValue(undefined),
+    markGroupFailed:   vi.fn().mockResolvedValue(undefined),
     logTokens:         vi.fn(),
     ...overrides,
   }
@@ -290,23 +290,25 @@ describe('runNotifier', () => {
     expect(deps.llm.complete).not.toHaveBeenCalled()
   })
 
-  it('skips and marks notified when no Slack channel configured', async () => {
+  it('marks group as failed when no Slack channel configured', async () => {
     const ctx: NotifierContext = { ...BASE_CONTEXT, slackChannel: null }
     const deps = makeDeps({ fetchContext: vi.fn().mockResolvedValue(ctx) })
     const result = await runNotifier(BASE_PAYLOAD, deps)
     expect(result.skipped).toBe(true)
     expect(result.skipReason).toBe('no slack channel or token')
-    expect(deps.markGroupNotified).toHaveBeenCalledWith('grp-001')
+    expect(deps.markGroupFailed).toHaveBeenCalledWith('grp-001', 'No notification channel configured')
+    expect(deps.markGroupNotified).not.toHaveBeenCalled()
     expect(deps.sendSlack).not.toHaveBeenCalled()
   })
 
-  it('skips and marks notified when no Slack bot token configured', async () => {
+  it('marks group as failed when no Slack bot token configured', async () => {
     const ctx: NotifierContext = { ...BASE_CONTEXT, slackBotToken: null }
     const deps = makeDeps({ fetchContext: vi.fn().mockResolvedValue(ctx) })
     const result = await runNotifier(BASE_PAYLOAD, deps)
     expect(result.skipped).toBe(true)
     expect(result.skipReason).toBe('no slack channel or token')
-    expect(deps.markGroupNotified).toHaveBeenCalledWith('grp-001')
+    expect(deps.markGroupFailed).toHaveBeenCalledWith('grp-001', 'No notification channel configured')
+    expect(deps.markGroupNotified).not.toHaveBeenCalled()
     expect(deps.sendSlack).not.toHaveBeenCalled()
   })
 
