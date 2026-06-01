@@ -1,35 +1,29 @@
-import { createClient } from '@/lib/supabase/server'
-import { redirect } from 'next/navigation'
+// M.2.b stub — all auth functions throw at runtime.
+// Proper service-to-service auth (X-Service-Token) is wired in M.2.e.
 
-export async function getSession() {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  return session
+export async function getSession(): Promise<null> {
+  throw new Error(
+    'Human auth not available in monitor. ' +
+    'Service-to-service auth (X-Service-Token) lands in M.2.e.'
+  )
 }
 
-export async function getUser() {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  return user
+export async function getUser(): Promise<null> {
+  throw new Error(
+    'Human auth not available in monitor. ' +
+    'Service-to-service auth (X-Service-Token) lands in M.2.e.'
+  )
 }
 
 export async function getProjectId(): Promise<string | null> {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return null
-
-  const { data } = await supabase
-    .from('users')
-    .select('project_id')
-    .eq('id', user.id)
-    .single()
-
-  return data?.project_id ?? null
+  throw new Error(
+    'getProjectId() not available in monitor until M.2.e middleware.'
+  )
 }
 
-export async function requireAuth() {
-  const supabase = await createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) redirect('/login')
-  return user
+export async function requireAuth(): Promise<{ id: string }> {
+  throw new Error(
+    'Human auth not available in monitor. ' +
+    'Service-to-service auth (X-Service-Token) lands in M.2.e.'
+  )
 }

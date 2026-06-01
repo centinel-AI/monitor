@@ -1,7 +1,7 @@
 import { inngest } from '@/lib/inngest/client'
 import { anthropic } from '@/lib/claude/client'
 import { SCORER_SYSTEM_PROMPT } from '@/lib/claude/prompts'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 import { getRuleBasedScore } from '@/lib/plans'
 import type { GroupEventPayload, GroupScoredPayload } from '@/types/events'
 
@@ -178,7 +178,7 @@ export async function runScorer(
   // 5. Parse response
   const scored = parseScorerResponse(text, reason)
 
-  // 6. Persist score to Supabase
+  // 6. Persist score
   await deps.updateGroupScore(groupId, scored.score, scored.reason)
 
   // 7. Forward downstream only when actionable
@@ -226,27 +226,38 @@ export const scorer = inngest.createFunction(
 
     // Step 2 — Fetch group context (services, incidents, recent deploys)
     const ctx = await step.run('fetch-context', async () => {
-      const supabase = createServiceClient()
       const ago30min = new Date(Date.now() - 30 * 60 * 1000).toISOString()
 
-      const [{ data: group }, { data: incidents }, { data: deploys }] = await Promise.all([
-        supabase.from('alert_groups').select('id, event_ids, service_ids, score, window_end').eq('id', groupId).single(),
-        supabase.from('incidents').select('title, severity, started_at').eq('project_id', projectId).order('started_at', { ascending: false }).limit(5),
-        supabase.from('deploys').select('project, branch, author, deployed_at').eq('project_id', projectId).gte('deployed_at', ago30min),
+      const [groupRow, incidents, deploys] = await Promise.all([
+        query<{ id: string; event_ids: string[]; service_ids: string[]; score: number | null; window_end: string | null }>(
+          'SELECT id, event_ids, service_ids, score, window_end FROM alert_groups WHERE id = $1',
+          [groupId],
+        ).then(r => r[0] ?? null),
+        query<{ title: string; severity: string; started_at: string }>(
+          'SELECT title, severity, started_at FROM incidents WHERE project_id = $1 ORDER BY started_at DESC LIMIT 5',
+          [projectId],
+        ),
+        query<{ project: string; branch: string | null; author: string | null; deployed_at: string }>(
+          'SELECT project, branch, author, deployed_at FROM deploys WHERE project_id = $1 AND deployed_at >= $2',
+          [projectId, ago30min],
+        ),
       ])
 
-      if (!group) throw new Error(`Group ${groupId} not found`)
+      if (!groupRow) throw new Error(`Group ${groupId} not found`)
 
-      const serviceIds = group.service_ids ?? []
-      const { data: services } = serviceIds.length > 0
-        ? await supabase.from('services').select('name, criticality, source').in('id', serviceIds)
-        : { data: [] }
+      const serviceIds = groupRow.service_ids ?? []
+      const services = serviceIds.length > 0
+        ? await query<{ name: string; criticality: number; source: string }>(
+            `SELECT name, criticality, source FROM services WHERE id = ANY($1::uuid[])`,
+            [serviceIds],
+          )
+        : []
 
       return {
-        group:           { id: group.id, event_ids: group.event_ids ?? [], service_ids: group.service_ids ?? [], score: group.score, window_end: group.window_end },
-        services:        (services ?? []) as ScorerContext['services'],
-        recentIncidents: (incidents ?? []) as ScorerContext['recentIncidents'],
-        recentDeploys:   (deploys ?? []) as ScorerContext['recentDeploys'],
+        group:           { id: groupRow.id, event_ids: groupRow.event_ids ?? [], service_ids: groupRow.service_ids ?? [], score: groupRow.score, window_end: groupRow.window_end },
+        services:        services as ScorerContext['services'],
+        recentIncidents: incidents as ScorerContext['recentIncidents'],
+        recentDeploys:   deploys as ScorerContext['recentDeploys'],
       }
     })
 
@@ -281,10 +292,12 @@ export const scorer = inngest.createFunction(
     console.log(`Scorer: ${claudeResult.inputTokens} in / ${claudeResult.outputTokens} out`)
     const scored = parseScorerResponse(claudeResult.text, reason)
 
-    // Step 4 — Persist score to Supabase
+    // Step 4 — Persist score
     await step.run('update-score', async () => {
-      const supabase = createServiceClient()
-      await supabase.from('alert_groups').update({ score: scored.score, score_reason: scored.reason }).eq('id', groupId)
+      await query(
+        'UPDATE alert_groups SET score = $1, score_reason = $2 WHERE id = $3',
+        [scored.score, scored.reason, groupId],
+      )
     })
 
     // Emit downstream only when actionable

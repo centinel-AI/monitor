@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { requireAuth } from '@/lib/auth'
+import { query } from '@/lib/db/client'
 import { generatePostmortem } from '@/agents/postmortem'
 
 // ─── GET /api/incidents/[id]/postmortem ───────────────────────────────────────
@@ -9,27 +10,17 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ): Promise<NextResponse> {
   const { id } = await params
-  const supabase = await createClient()
+  const user = await requireAuth()
 
-  // Verify session
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
-  // Fetch project for this user
-  const { data: profile } = await supabase
-    .from('users')
-    .select('project_id')
-    .eq('id', user.id)
-    .single()
+  const profileRows = await query<{ project_id: string }>('SELECT project_id FROM users WHERE id = $1', [user.id])
+  const profile = profileRows[0] ?? null
   if (!profile) return NextResponse.json({ error: 'User not found' }, { status: 404 })
 
-  // Fetch incident — enforce project ownership
-  const { data: incident } = await supabase
-    .from('incidents')
-    .select('id, project_id, postmortem')
-    .eq('id', id)
-    .eq('project_id', profile.project_id)
-    .single()
+  const incidentRows = await query<{ id: string; project_id: string; postmortem: string | null }>(
+    'SELECT id, project_id, postmortem FROM incidents WHERE id = $1 AND project_id = $2',
+    [id, profile.project_id],
+  )
+  const incident = incidentRows[0] ?? null
 
   if (!incident) return NextResponse.json({ error: 'Incident not found' }, { status: 404 })
   if (!incident.postmortem) return NextResponse.json({ error: 'No postmortem yet' }, { status: 404 })
@@ -44,26 +35,15 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ): Promise<NextResponse> {
   const { id } = await params
-  const supabase = await createClient()
+  const user = await requireAuth()
 
-  // Verify session
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
-  // Fetch project for this user
-  const { data: profile } = await supabase
-    .from('users')
-    .select('project_id')
-    .eq('id', user.id)
-    .single()
+  const profileRows = await query<{ project_id: string }>('SELECT project_id FROM users WHERE id = $1', [user.id])
+  const profile = profileRows[0] ?? null
   if (!profile) return NextResponse.json({ error: 'User not found' }, { status: 404 })
 
   // Plan gate: postmortem generation requires Team or Pro
-  const { data: org } = await supabase
-    .from('projects')
-    .select('plan')
-    .eq('id', profile.project_id)
-    .single()
+  const orgRows = await query<{ plan: string }>('SELECT plan FROM projects WHERE id = $1', [profile.project_id])
+  const org = orgRows[0] ?? null
 
   if (org?.plan === 'free' || !org?.plan) {
     return NextResponse.json({
@@ -72,13 +52,11 @@ export async function POST(
     }, { status: 403 })
   }
 
-  // Fetch incident — enforce project ownership
-  const { data: incident } = await supabase
-    .from('incidents')
-    .select('id, project_id, status, postmortem')
-    .eq('id', id)
-    .eq('project_id', profile.project_id)
-    .single()
+  const incidentRows = await query<{ id: string; project_id: string; status: string; postmortem: string | null }>(
+    'SELECT id, project_id, status, postmortem FROM incidents WHERE id = $1 AND project_id = $2',
+    [id, profile.project_id],
+  )
+  const incident = incidentRows[0] ?? null
 
   if (!incident) return NextResponse.json({ error: 'Incident not found' }, { status: 404 })
 

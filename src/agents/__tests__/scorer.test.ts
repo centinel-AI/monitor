@@ -225,7 +225,7 @@ describe('runScorer', () => {
     expect(deps.logTokens).toHaveBeenCalledWith(100, 20)
   })
 
-  it('persists score to Supabase via updateGroupScore', async () => {
+  it('persists score via updateGroupScore', async () => {
     const deps = makeDeps()
     await runScorer(BASE_PAYLOAD, deps)
 

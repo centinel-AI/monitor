@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 import { inngest } from '@/lib/inngest/client'
 import { rateLimit } from '@/lib/rate-limit'
 import { normalizeKubernetes } from '../_normalizers/kubernetes'
@@ -7,7 +7,6 @@ import { normalizeGitlab, normalizeGitLabEvent } from '../_normalizers/gitlab'
 import { normalizePrometheus } from '../_normalizers/prometheus'
 import { normalizeGrafana } from '../_normalizers/grafana'
 import type { AlertSource, NormalizedAlert } from '@/types/events'
-import type { Json } from '@/types/database'
 
 const VALID_SOURCES: AlertSource[] = [
   'kubernetes',
@@ -23,8 +22,6 @@ async function resolveProject(
   request: NextRequest,
   source: AlertSource
 ): Promise<string | null> {
-  const supabase = createServiceClient()
-
   // GitLab usa X-Gitlab-Token; el resto usa Authorization: Bearer <token>
   let token: string | null = null
 
@@ -37,14 +34,11 @@ async function resolveProject(
 
   if (!token) return null
 
-  const { data, error } = await supabase
-    .from('projects')
-    .select('id')
-    .eq('api_token', token)
-    .single()
-
-  if (error || !data) return null
-  return data.id
+  const rows = await query<{ id: string }>(
+    'SELECT id FROM projects WHERE api_token = $1',
+    [token],
+  )
+  return rows[0]?.id ?? null
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
@@ -75,7 +69,6 @@ export async function POST(
     // 2. Parsear body
     const body = await request.json()
 
-    const supabase  = createServiceClient()
     const eventIds: string[] = []
 
     // ── GitLab: dispatch via X-Gitlab-Event header ────────────────────────────
@@ -84,35 +77,22 @@ export async function POST(
       const { alert, deploy } = normalizeGitLabEvent(body, eventType, projectId)
 
       if (deploy) {
-        await supabase.from('deploys').insert({
-          project_id:  deploy.project_id,
-          project:     deploy.project,
-          branch:      deploy.branch ?? null,
-          commit_sha:  deploy.commit_sha ?? null,
-          author:      deploy.author ?? null,
-          environment: deploy.environment ?? null,
-          status:      deploy.status ?? null,
-        })
+        await query(
+          `INSERT INTO deploys (project_id, project, branch, commit_sha, author, environment, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [deploy.project_id, deploy.project, deploy.branch ?? null, deploy.commit_sha ?? null, deploy.author ?? null, deploy.environment ?? null, deploy.status ?? null],
+        )
       }
 
       if (alert) {
-        const { data: saved, error: insertError } = await supabase
-          .from('alert_events')
-          .insert({
-            project_id:  alert.projectId,
-            service_id:  alert.serviceId ?? null,
-            source:      alert.source,
-            reason:      alert.reason,
-            severity:    alert.severity,
-            message:     alert.message,
-            raw_payload: alert.rawPayload as Json,
-            score:       alert.score ?? null,
-            timestamp:   alert.timestamp,
-          })
-          .select('id')
-          .single()
+        const saved = await query<{ id: string }>(
+          `INSERT INTO alert_events (project_id, service_id, source, reason, severity, message, raw_payload, score, timestamp)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING id`,
+          [alert.projectId, alert.serviceId ?? null, alert.source, alert.reason, alert.severity, alert.message, alert.rawPayload, alert.score ?? null, alert.timestamp],
+        ).then(r => r[0] ?? null)
 
-        if (!insertError && saved) {
+        if (saved) {
           eventIds.push(saved.id)
           await inngest.send({
             name: 'centinelai/alert.received',
@@ -148,24 +128,15 @@ export async function POST(
       // Auto-create service on first seen source+name combination
       const serviceId = alert.serviceId ?? await findOrCreateService(projectId, source, alert)
 
-      const { data: saved, error: insertError } = await supabase
-        .from('alert_events')
-        .insert({
-          project_id:  alert.projectId,
-          service_id:  serviceId,
-          source:      alert.source,
-          reason:      alert.reason,
-          severity:    alert.severity,
-          message:     alert.message,
-          raw_payload: alert.rawPayload as Json,
-          score:       alert.score ?? null,
-          timestamp:   alert.timestamp,
-        })
-        .select('id')
-        .single()
+      const saved = await query<{ id: string }>(
+        `INSERT INTO alert_events (project_id, service_id, source, reason, severity, message, raw_payload, score, timestamp)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id`,
+        [alert.projectId, serviceId, alert.source, alert.reason, alert.severity, alert.message, alert.rawPayload, alert.score ?? null, alert.timestamp],
+      ).then(r => r[0] ?? null)
 
-      if (insertError || !saved) {
-        console.error('[webhook] insert error', insertError)
+      if (!saved) {
+        console.error('[webhook] insert error: no row returned')
         continue
       }
 
@@ -220,31 +191,19 @@ async function findOrCreateService(
   const name = getServiceName(source, payload)
   if (!name) return null
 
-  const supabase = createServiceClient()
+  const existing = await query<{ id: string }>(
+    'SELECT id FROM services WHERE project_id = $1 AND source = $2 AND name = $3 LIMIT 1',
+    [projectId, source, name],
+  )
+  if (existing.length > 0) return existing[0].id
 
-  const { data: existing } = await supabase
-    .from('services')
-    .select('id')
-    .eq('project_id', projectId)
-    .eq('source', source as 'kubernetes' | 'gitlab' | 'prometheus' | 'grafana' | 'datadog' | 'slack')
-    .eq('name', name)
-    .single()
-
-  if (existing) return existing.id
-
-  const { data: created } = await supabase
-    .from('services')
-    .insert({
-      project_id:  projectId,
-      name,
-      source:      source as 'kubernetes' | 'gitlab' | 'prometheus' | 'grafana' | 'datadog' | 'slack',
-      namespace:   (payload.rawPayload?.namespace as string) ?? null,
-      criticality: 5,
-    })
-    .select('id')
-    .single()
-
-  return created?.id ?? null
+  const created = await query<{ id: string }>(
+    `INSERT INTO services (project_id, name, source, namespace, criticality)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id`,
+    [projectId, name, source, (payload.rawPayload?.namespace as string) ?? null, 5],
+  )
+  return created[0]?.id ?? null
 }
 
 // ─── Dispatch a normalizador ──────────────────────────────────────────────────

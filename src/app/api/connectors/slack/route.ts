@@ -1,13 +1,10 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { requireAuth } from '@/lib/auth'
+import { query } from '@/lib/db/client'
 
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
-    const { data: { user } } = await supabase.auth.getUser()
-    if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const user = await requireAuth()
 
     const body = await request.json() as { channel?: unknown; botToken?: unknown }
     const { channel, botToken } = body
@@ -16,32 +13,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Channel required' }, { status: 400 })
     }
 
-    const { data: userData, error: userError } = await supabase
-      .from('users')
-      .select('project_id')
-      .eq('id', user.id)
-      .single()
+    const userRows = await query<{ project_id: string }>(
+      'SELECT project_id FROM users WHERE id = $1',
+      [user.id],
+    )
+    const userData = userRows[0] ?? null
+    if (!userData) return NextResponse.json({ error: 'User not found' }, { status: 404 })
 
-    if (userError || !userData) {
-      return NextResponse.json({ error: 'User not found' }, { status: 404 })
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const updateData: Record<string, string> = { slack_channel: channel as string }
-    if (typeof botToken === 'string' && botToken.startsWith('xoxb-')) {
-      updateData.slack_bot_token = botToken
-    }
-
-    const { error: updateError } = await supabase
-      .from('projects')
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      .update(updateData as any)
-      .eq('id', userData.project_id)
-
-    if (updateError) {
-      console.error('Update error:', updateError)
-      return NextResponse.json({ error: 'Failed to save', details: updateError.message }, { status: 500 })
-    }
+    await query(
+      typeof botToken === 'string' && botToken.startsWith('xoxb-')
+        ? 'UPDATE projects SET slack_channel = $1, slack_bot_token = $2 WHERE id = $3'
+        : 'UPDATE projects SET slack_channel = $1 WHERE id = $2',
+      typeof botToken === 'string' && botToken.startsWith('xoxb-')
+        ? [channel as string, botToken, userData.project_id]
+        : [channel as string, userData.project_id],
+    )
 
     return NextResponse.json({ success: true })
   } catch (error) {

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 
 // IMPORTANT: This route is PUBLIC — Slack authenticates via signing secret,
 // not user sessions. Do not add cookie/session auth here.
@@ -22,7 +22,6 @@ export async function POST(request: Request): Promise<NextResponse> {
     const action = payload.actions?.[0]
     if (!action) return NextResponse.json({ ok: true })
 
-    const supabase = createServiceClient()
     const appUrl   = process.env.NEXT_PUBLIC_APP_URL ?? 'https://centinelai.io'
 
     // ── declare_incident ────────────────────────────────────────────────────
@@ -35,27 +34,18 @@ export async function POST(request: Request): Promise<NextResponse> {
         severity?: string
       }
 
-      const { data: incident, error } = await supabase
-        .from('incidents')
-        .insert({
-          project_id: projectId,
-          group_id:   groupId ?? null,
-          title:      title ?? 'Incidente declarado desde Slack',
-          severity:   (severity ?? 'high') as 'critical' | 'high' | 'medium' | 'low',
-          status:     'open',
-        })
-        .select('id')
-        .single()
-
-      if (error) {
-        console.error('[slack/actions] incident creation error:', error)
-      }
+      const incident = await query<{ id: string }>(
+        `INSERT INTO incidents (project_id, group_id, title, severity, status)
+         VALUES ($1, $2, $3, $4, 'open')
+         RETURNING id`,
+        [projectId, groupId ?? null, title ?? 'Incidente declarado desde Slack', (severity ?? 'high') as string],
+      ).then(r => r[0] ?? null)
 
       if (groupId && incident?.id) {
-        await supabase
-          .from('alert_groups')
-          .update({ feedback: 'escalated' })
-          .eq('id', groupId)
+        await query(
+          `UPDATE alert_groups SET feedback = 'escalated' WHERE id = $1`,
+          [groupId],
+        )
       }
 
       if (payload.response_url) {
@@ -84,23 +74,22 @@ export async function POST(request: Request): Promise<NextResponse> {
       if (groupId) {
         const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
 
-        const { data: group } = await supabase
-          .from('alert_groups')
-          .select('id, project_id')
-          .eq('id', groupId)
-          .single()
+        const groupRows = await query<{ id: string; project_id: string }>(
+          'SELECT id, project_id FROM alert_groups WHERE id = $1',
+          [groupId],
+        )
+        const group = groupRows[0] ?? null
 
         if (group) {
           await Promise.all([
-            supabase.from('snoozed_groups').insert({
-              group_id:   groupId,
-              project_id: group.project_id,
-              expires_at: expiresAt,
-            }),
-            supabase
-              .from('alert_groups')
-              .update({ snoozed_until: expiresAt, feedback: 'snoozed' })
-              .eq('id', groupId),
+            query(
+              'INSERT INTO snoozed_groups (group_id, project_id, expires_at) VALUES ($1, $2, $3)',
+              [groupId, group.project_id, expiresAt],
+            ),
+            query(
+              `UPDATE alert_groups SET snoozed_until = $1, feedback = 'snoozed' WHERE id = $2`,
+              [expiresAt, groupId],
+            ),
           ])
         }
       }

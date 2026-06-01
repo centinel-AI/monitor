@@ -1,7 +1,7 @@
 import { inngest } from '@/lib/inngest/client'
 import { anthropic } from '@/lib/claude/client'
 import { CORRELATOR_SYSTEM_PROMPT } from '@/lib/claude/prompts'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 import type { GroupScoredPayload, GroupCriticalPayload } from '@/types/events'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -297,13 +297,11 @@ export const correlator = inngest.createFunction(
 
     // Step 1 — Fetch current group to check dedup / already-correlated
     const currentGroup = await step.run('fetch-group', async () => {
-      const supabase = createServiceClient()
-      const { data } = await supabase
-        .from('alert_groups')
-        .select('id, event_ids, service_ids, score, score_reason, correlated, window_end')
-        .eq('id', groupId)
-        .single()
-      return (data as RelatedGroupData) ?? null
+      const rows = await query<RelatedGroupData>(
+        'SELECT id, event_ids, service_ids, score, score_reason, correlated, window_end FROM alert_groups WHERE id = $1',
+        [groupId],
+      )
+      return rows[0] ?? null
     })
 
     if (!currentGroup) {
@@ -316,27 +314,25 @@ export const correlator = inngest.createFunction(
 
     // Step 2 — Fetch related groups from last 30 min
     const relatedGroups: RelatedGroupData[] = await step.run('fetch-related-groups', async () => {
-      const supabase  = createServiceClient()
-      const ago30min  = new Date(Date.now() - 30 * 60 * 1000).toISOString()
-      const { data }  = await supabase
-        .from('alert_groups')
-        .select('id, event_ids, service_ids, score, score_reason, correlated, window_end')
-        .eq('project_id', projectId)
-        .neq('id', groupId)
-        .gt('score', 30)
-        .gte('created_at', ago30min)
-        .eq('notified', false)
-        .order('score', { ascending: false })
-      return (data ?? []) as RelatedGroupData[]
+      const ago30min = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+      return query<RelatedGroupData>(
+        `SELECT id, event_ids, service_ids, score, score_reason, correlated, window_end
+         FROM alert_groups
+         WHERE project_id = $1 AND id != $2 AND score > 30
+           AND created_at >= $3 AND notified = false
+         ORDER BY score DESC`,
+        [projectId, groupId, ago30min],
+      )
     })
 
     // Step 3 — Fetch service names for all affected groups
     const services: ServiceInfo[] = await step.run('fetch-services', async () => {
       const allIds = Array.from(new Set([...serviceIds, ...relatedGroups.flatMap((g: RelatedGroupData) => g.service_ids ?? [])]))
       if (allIds.length === 0) return [] as ServiceInfo[]
-      const supabase = createServiceClient()
-      const { data } = await supabase.from('services').select('id, name, criticality, source').in('id', allIds)
-      return (data ?? []) as ServiceInfo[]
+      return query<ServiceInfo>(
+        `SELECT id, name, criticality, source FROM services WHERE id = ANY($1::uuid[])`,
+        [allIds],
+      )
     })
 
     const serviceMap   = new Map(services.map((s) => [s.id, s]))
@@ -387,11 +383,10 @@ export const correlator = inngest.createFunction(
     if (correlation.correlated) {
       finalScore = correlation.combined_score
       await step.run('update-correlated', async () => {
-        const supabase = createServiceClient()
-        await supabase
-          .from('alert_groups')
-          .update({ score: finalScore, score_reason: correlation.root_cause, correlated: true })
-          .eq('id', groupId)
+        await query(
+          'UPDATE alert_groups SET score = $1, score_reason = $2, correlated = true WHERE id = $3',
+          [finalScore, correlation.root_cause, groupId],
+        )
       })
       console.log(`[correlator] Correlated ${relatedGroups.length + 1} groups. Combined score: ${finalScore}`)
     }

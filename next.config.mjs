@@ -17,7 +17,7 @@ const nextConfig = {
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: blob:",
               "font-src 'self'",
-              "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.anthropic.com https://app.inngest.com",
+              "connect-src 'self' https://api.anthropic.com https://app.inngest.com",
             ].join('; '),
           },
         ],

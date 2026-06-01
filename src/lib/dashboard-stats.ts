@@ -1,4 +1,4 @@
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 
 export function getScoreLabel(score: number): string {
   if (score >= 90) return 'Critical'
@@ -88,8 +88,6 @@ export async function getDashboardStats(projectId: string): Promise<{
   interruptionsSent: number
   openIncidents: number
 }> {
-  const supabase = createServiceClient()
-
   const todayStart = new Date()
   todayStart.setUTCHours(0, 0, 0, 0)
   const todayIso = todayStart.toISOString()
@@ -98,176 +96,99 @@ export async function getDashboardStats(projectId: string): Promise<{
   yesterdayStart.setUTCDate(yesterdayStart.getUTCDate() - 1)
   const yesterdayIso = yesterdayStart.toISOString()
 
-  const [
-    { count: alertsToday },
-    { count: alertsYesterday },
-    { count: filtered },
-    { count: interruptionsSent },
-    { count: openIncidents },
-  ] = await Promise.all([
-    supabase
-      .from('alert_events')
-      .select('*', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .gte('timestamp', todayIso),
-
-    supabase
-      .from('alert_events')
-      .select('*', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .gte('timestamp', yesterdayIso)
-      .lt('timestamp', todayIso),
-
-    supabase
-      .from('alert_groups')
-      .select('*', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .eq('notified', false)
-      .gte('created_at', todayIso),
-
-    supabase
-      .from('alert_groups')
-      .select('*', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .eq('notified', true)
-      .gte('created_at', todayIso),
-
-    supabase
-      .from('incidents')
-      .select('*', { count: 'exact', head: true })
-      .eq('project_id', projectId)
-      .eq('status', 'open'),
+  const [alertsToday, alertsYesterday, filtered, interruptionsSent, openIncidents] = await Promise.all([
+    query<{ count: string }>('SELECT COUNT(*) FROM alert_events WHERE project_id = $1 AND timestamp >= $2', [projectId, todayIso])
+      .then(r => parseInt(r[0]?.count ?? '0', 10)),
+    query<{ count: string }>('SELECT COUNT(*) FROM alert_events WHERE project_id = $1 AND timestamp >= $2 AND timestamp < $3', [projectId, yesterdayIso, todayIso])
+      .then(r => parseInt(r[0]?.count ?? '0', 10)),
+    query<{ count: string }>('SELECT COUNT(*) FROM alert_groups WHERE project_id = $1 AND notified = false AND created_at >= $2', [projectId, todayIso])
+      .then(r => parseInt(r[0]?.count ?? '0', 10)),
+    query<{ count: string }>('SELECT COUNT(*) FROM alert_groups WHERE project_id = $1 AND notified = true AND created_at >= $2', [projectId, todayIso])
+      .then(r => parseInt(r[0]?.count ?? '0', 10)),
+    query<{ count: string }>('SELECT COUNT(*) FROM incidents WHERE project_id = $1 AND status = $2', [projectId, 'open'])
+      .then(r => parseInt(r[0]?.count ?? '0', 10)),
   ])
-
   return {
-    alertsToday:       alertsToday       ?? 0,
-    alertsYesterday:   alertsYesterday   ?? 0,
-    filtered:          filtered          ?? 0,
-    interruptionsSent: interruptionsSent ?? 0,
-    openIncidents:     openIncidents     ?? 0,
+    alertsToday:       alertsToday,
+    alertsYesterday:   alertsYesterday,
+    filtered:          filtered,
+    interruptionsSent: interruptionsSent,
+    openIncidents:     openIncidents,
   }
 }
 
 // ─── Top alerts ───────────────────────────────────────────────────────────────
 
 export async function getTopAlerts(projectId: string): Promise<TopAlert[]> {
-  const supabase = createServiceClient()
-
   const todayStart = new Date()
   todayStart.setUTCHours(0, 0, 0, 0)
 
-  const { data: groups } = await supabase
-    .from('alert_groups')
-    .select('id, score, score_reason, service_ids, created_at')
-    .eq('project_id', projectId)
-    .gte('created_at', todayStart.toISOString())
-    .not('score', 'is', null)
-    .order('score', { ascending: false })
-    .limit(5)
+  const groups = await query<{ id: string; score: number | null; score_reason: string | null; service_ids: string[]; created_at: string }>(
+    `SELECT id, score, score_reason, service_ids, created_at
+     FROM alert_groups
+     WHERE project_id = $1 AND created_at >= $2 AND score IS NOT NULL
+     ORDER BY score DESC LIMIT 5`,
+    [projectId, todayStart.toISOString()],
+  )
 
-  if (!groups || groups.length === 0) return []
+  if (groups.length === 0) return []
 
   // For groups where score_reason is null, fall back to the first event's reason
-  const nullReasonGroupIds = groups
-    .filter((g) => !g.score_reason)
-    .map((g) => g.id)
-
+  const nullReasonGroupIds = groups.filter((g) => !g.score_reason).map((g) => g.id)
   const eventReasonMap: Record<string, string> = {}
   if (nullReasonGroupIds.length > 0) {
-    const { data: events } = await supabase
-      .from('alert_events')
-      .select('grouped_id, reason')
-      .in('grouped_id', nullReasonGroupIds)
-      .not('reason', 'is', null)
-    for (const ev of events ?? []) {
-      if (ev.grouped_id && !eventReasonMap[ev.grouped_id]) {
-        eventReasonMap[ev.grouped_id] = ev.reason
-      }
+    const placeholders = nullReasonGroupIds.map((_, i) => `$${i + 1}`).join(', ')
+    const events = await query<{ grouped_id: string; reason: string }>(
+      `SELECT grouped_id, reason FROM alert_events WHERE grouped_id IN (${placeholders}) AND reason IS NOT NULL`,
+      nullReasonGroupIds,
+    )
+    for (const ev of events) {
+      if (ev.grouped_id && !eventReasonMap[ev.grouped_id]) eventReasonMap[ev.grouped_id] = ev.reason
     }
   }
 
   // Resolve service names
-  const serviceIds = Array.from(new Set(
-    groups.flatMap((g) => g.service_ids ?? [])
-  ))
-
+  const serviceIds = Array.from(new Set(groups.flatMap((g) => g.service_ids ?? [])))
   let serviceMap: Record<string, string> = {}
   if (serviceIds.length > 0) {
-    const { data: svcs } = await supabase
-      .from('services')
-      .select('id, name')
-      .in('id', serviceIds)
-    serviceMap = Object.fromEntries(svcs?.map((s) => [s.id, s.name]) ?? [])
+    const placeholders = serviceIds.map((_, i) => `$${i + 1}`).join(', ')
+    const svcs = await query<{ id: string; name: string }>(`SELECT id, name FROM services WHERE id IN (${placeholders})`, serviceIds)
+    serviceMap = Object.fromEntries(svcs.map((s) => [s.id, s.name]))
   }
 
-  return groups.map((g) => ({
-    id:          g.id,
-    score:       g.score ?? 0,
-    reason:      g.score_reason ?? eventReasonMap[g.id] ?? 'Unknown',
-    serviceName: g.service_ids?.[0] ? (serviceMap[g.service_ids[0]] ?? null) : null,
-    createdAt:   g.created_at,
-  }))
+  return groups.map((g) => ({ id: g.id, score: g.score ?? 0, reason: g.score_reason ?? eventReasonMap[g.id] ?? 'Unknown', serviceName: g.service_ids?.[0] ? (serviceMap[g.service_ids[0]] ?? null) : null, createdAt: g.created_at }))
 }
 
 // ─── Services ─────────────────────────────────────────────────────────────────
 
 export async function getServicesWithStatus(projectId: string): Promise<ServiceWithStatus[]> {
-  const supabase = createServiceClient()
   const ago24h   = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
   const ago2h    = new Date(Date.now() -  2 * 60 * 60 * 1000).toISOString()
 
-  const { data: services } = await supabase
-    .from('services')
-    .select('id, name, source, namespace, criticality')
-    .eq('project_id', projectId)
-    .order('criticality', { ascending: false })
+  const services = await query<{ id: string; name: string; source: string; namespace: string | null; criticality: number }>(
+    `SELECT id, name, source, namespace, criticality FROM services WHERE project_id = $1 ORDER BY criticality DESC`,
+    [projectId],
+  )
 
-  if (!services || services.length === 0) return []
+  if (services.length === 0) return []
 
   const results = await Promise.all(
     services.map(async (service) => {
-      const [
-        { data: latestScoreRows },
-        { count: eventCount },
-        { data: lastEvents },
-        { data: recentEvents },
-      ] = await Promise.all([
+      const [latestScoreRows, eventCount, lastEvents, recentEvents] = await Promise.all([
         // Latest scored event for this service (direct — no alert_groups join needed)
-        supabase
-          .from('alert_events')
-          .select('score, timestamp')
-          .eq('service_id', service.id)
-          .eq('project_id', projectId)
-          .not('score', 'is', null)
-          .order('timestamp', { ascending: false })
-          .limit(1),
+        query<{ score: number; timestamp: string }>(`SELECT score, timestamp FROM alert_events WHERE service_id = $1 AND project_id = $2 AND score IS NOT NULL ORDER BY timestamp DESC LIMIT 1`, [service.id, projectId]),
 
         // All events in last 24 h (scored or not)
-        supabase
-          .from('alert_events')
-          .select('*', { count: 'exact', head: true })
-          .eq('project_id', projectId)
-          .eq('service_id', service.id)
-          .gte('timestamp', ago24h),
+        query<{ count: string }>(`SELECT COUNT(*) FROM alert_events WHERE project_id = $1 AND service_id = $2 AND timestamp >= $3`, [projectId, service.id, ago24h]).then(r => parseInt(r[0]?.count ?? '0', 10)),
 
         // Most recent event timestamp
-        supabase
-          .from('alert_events')
-          .select('timestamp')
-          .eq('service_id', service.id)
-          .order('timestamp', { ascending: false })
-          .limit(1),
+        query<{ timestamp: string }>(`SELECT timestamp FROM alert_events WHERE service_id = $1 ORDER BY timestamp DESC LIMIT 1`, [service.id]),
 
         // Events for sparkline + trend (last 2h)
-        supabase
-          .from('alert_events')
-          .select('timestamp')
-          .eq('service_id', service.id)
-          .gte('timestamp', ago2h)
-          .order('timestamp', { ascending: true }),
+        query<{ timestamp: string }>(`SELECT timestamp FROM alert_events WHERE service_id = $1 AND timestamp >= $2 ORDER BY timestamp ASC`, [service.id, ago2h]),
       ])
 
-      const events = recentEvents ?? []
+      const events = recentEvents
 
       return {
         id:            service.id,
@@ -275,9 +196,9 @@ export async function getServicesWithStatus(projectId: string): Promise<ServiceW
         source:        service.source,
         namespace:     service.namespace ?? null,
         criticality:   service.criticality,
-        latestScore:   latestScoreRows?.[0]?.score ?? null,
-        lastEventAt:   lastEvents?.[0]?.timestamp ?? null,
-        eventCount24h: eventCount ?? 0,
+        latestScore:   latestScoreRows[0]?.score ?? null,
+        lastEventAt:   lastEvents[0]?.timestamp ?? null,
+        eventCount24h: eventCount,
         sparklineData: buildSparklineData(events),
         trend:         calcTrend(events),
       }

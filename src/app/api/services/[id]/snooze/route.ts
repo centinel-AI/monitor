@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuth, getProjectId } from '@/lib/auth'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 
 export async function POST(
   _request: NextRequest,
@@ -14,29 +14,22 @@ export async function POST(
     }
 
     const serviceId = params.id
-    const supabase  = createServiceClient()
 
     // Verify the service belongs to this project
-    const { data: service } = await supabase
-      .from('services')
-      .select('id')
-      .eq('id', serviceId)
-      .eq('project_id', projectId)
-      .single()
-
-    if (!service) {
-      return NextResponse.json({ error: 'Service not found' }, { status: 404 })
-    }
+    const serviceRows = await query<{ id: string }>(
+      'SELECT id FROM services WHERE id = $1 AND project_id = $2',
+      [serviceId, projectId],
+    )
+    if (serviceRows.length === 0) return NextResponse.json({ error: 'Service not found' }, { status: 404 })
 
     const snoozedUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString()
 
     // Snooze all open alert_groups for this service by setting snoozed_until
-    await supabase
-      .from('alert_groups')
-      .update({ snoozed_until: snoozedUntil })
-      .contains('service_ids', [serviceId])
-      .eq('project_id', projectId)
-      .is('snoozed_until', null)
+    await query(
+      `UPDATE alert_groups SET snoozed_until = $1
+       WHERE $2 = ANY(service_ids) AND project_id = $3 AND snoozed_until IS NULL`,
+      [snoozedUntil, serviceId, projectId],
+    )
 
     return NextResponse.json({ success: true, snoozedUntil })
   } catch (err) {

@@ -1,7 +1,7 @@
 import { anthropic } from '@/lib/claude/client'
 import { POSTMORTEM_SYSTEM_PROMPT } from '@/lib/claude/prompts'
 import { generateEmbeddingText } from '@/lib/claude/embeddings'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 import { formatDuration, formatTime } from '@/lib/utils/time'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -50,34 +50,26 @@ interface ServiceRow {
 
 /**
  * Generates a complete blameless postmortem for a resolved incident,
- * stores the markdown and keyword embedding in Supabase, and returns
+ * stores the markdown and keyword embedding in the database, and returns
  * the markdown text.
  */
 export async function generatePostmortem(incidentId: string): Promise<string> {
-  const supabase = createServiceClient()
-
   // 1. Fetch incident
-  const { data: incident, error: incidentErr } = await supabase
-    .from('incidents')
-    .select('id, project_id, group_id, title, severity, status, started_at, resolved_at, postmortem')
-    .eq('id', incidentId)
-    .single()
-
-  if (incidentErr || !incident) {
-    throw new Error(`Incident ${incidentId} not found`)
-  }
-
-  const inc = incident as IncidentRow
+  const rows = await query<IncidentRow>(
+    'SELECT id, project_id, group_id, title, severity, status, started_at, resolved_at, postmortem FROM incidents WHERE id = $1',
+    [incidentId],
+  )
+  if (rows.length === 0) throw new Error(`Incident ${incidentId} not found`)
+  const inc = rows[0]
 
   // 2. Fetch related alert group
   let group: AlertGroupRow | null = null
   if (inc.group_id) {
-    const { data } = await supabase
-      .from('alert_groups')
-      .select('id, score_reason')
-      .eq('id', inc.group_id)
-      .single()
-    group = (data as AlertGroupRow) ?? null
+    const gRows = await query<AlertGroupRow>(
+      'SELECT id, score_reason FROM alert_groups WHERE id = $1',
+      [inc.group_id],
+    )
+    group = gRows[0] ?? null
   }
 
   // 3. Window: 2 hours before incident start → resolved_at (or now)
@@ -85,41 +77,35 @@ export async function generatePostmortem(incidentId: string): Promise<string> {
   const windowEnd    = inc.resolved_at ?? new Date().toISOString()
 
   // Fetch alert events and deploys in parallel
-  const [{ data: alertEvents }, { data: deploys }, { data: groupServices }] = await Promise.all([
-    supabase
-      .from('alert_events')
-      .select('id, severity, reason, message, timestamp')
-      .eq('project_id', inc.project_id)
-      .gte('timestamp', windowStart)
-      .lte('timestamp', windowEnd)
-      .order('timestamp', { ascending: true }),
-
-    supabase
-      .from('deploys')
-      .select('project, branch, author, deployed_at, status')
-      .eq('project_id', inc.project_id)
-      .gte('deployed_at', windowStart)
-      .lte('deployed_at', windowEnd)
-      .order('deployed_at', { ascending: true }),
-
+  const [alertEvents, deploys, groupServicesRow] = await Promise.all([
+    query<AlertEventRow>(
+      `SELECT id, severity, reason, message, timestamp FROM alert_events
+       WHERE project_id = $1 AND timestamp >= $2 AND timestamp <= $3
+       ORDER BY timestamp ASC`,
+      [inc.project_id, windowStart, windowEnd],
+    ),
+    query<DeployRow>(
+      `SELECT project, branch, author, deployed_at, status FROM deploys
+       WHERE project_id = $1 AND deployed_at >= $2 AND deployed_at <= $3
+       ORDER BY deployed_at ASC`,
+      [inc.project_id, windowStart, windowEnd],
+    ),
     inc.group_id
-      ? supabase
-          .from('alert_groups')
-          .select('service_ids')
-          .eq('id', inc.group_id)
-          .single()
-      : Promise.resolve({ data: null }),
+      ? query<{ service_ids: string[] }>(
+          'SELECT service_ids FROM alert_groups WHERE id = $1',
+          [inc.group_id],
+        ).then(r => r[0] ?? null)
+      : Promise.resolve(null),
   ])
 
   // 4. Fetch service details
-  const serviceIds: string[] = (groupServices as { service_ids?: string[] } | null)?.service_ids ?? []
+  const serviceIds: string[] = groupServicesRow?.service_ids ?? []
   let services: ServiceRow[] = []
   if (serviceIds.length > 0) {
-    const { data } = await supabase
-      .from('services')
-      .select('id, name, source, criticality')
-      .in('id', serviceIds)
-    services = (data ?? []) as ServiceRow[]
+    services = await query<ServiceRow>(
+      'SELECT id, name, source, criticality FROM services WHERE id = ANY($1::uuid[])',
+      [serviceIds],
+    )
   }
 
   // 5. Calculate duration
@@ -129,8 +115,8 @@ export async function generatePostmortem(incidentId: string): Promise<string> {
   const duration = durationMs !== null ? formatDuration(durationMs) : 'ongoing'
 
   // 6. Build Claude context
-  const events  = (alertEvents ?? []) as AlertEventRow[]
-  const deps    = (deploys ?? []) as DeployRow[]
+  const events  = alertEvents
+  const deps    = deploys
 
   const servicesText = services.length > 0
     ? services.map((s) => `- ${s.name} (${s.source}, criticality: ${s.criticality}/10)`).join('\n')
@@ -193,15 +179,11 @@ Generate a complete blameless postmortem in Spanish.
   // 8. Generate keyword embedding (lightweight RAG)
   const embeddingKeywords = await generateEmbeddingText(markdownText)
 
-  // 9. Persist postmortem + keywords to Supabase
-  await supabase
-    .from('incidents')
-    .update({
-      postmortem:           markdownText,
-      // Store keywords in postmortem field as appendix (until pgvector is added)
-      // Real pgvector embedding update happens via a separate migration
-    })
-    .eq('id', incidentId)
+  // 9. Persist postmortem
+  await query(
+    'UPDATE incidents SET postmortem = $1 WHERE id = $2',
+    [markdownText, incidentId],
+  )
 
   // Store keywords separately via a console log for now — pgvector migration pending
   console.log(`[postmortem] Generated for incident ${incidentId} | keywords: ${embeddingKeywords.slice(0, 100)}`)

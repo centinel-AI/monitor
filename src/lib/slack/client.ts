@@ -1,5 +1,5 @@
 import { WebClient } from '@slack/web-api'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 
 export const slack = new WebClient(process.env.SLACK_BOT_TOKEN)
 
@@ -9,18 +9,14 @@ export interface SlackConfig {
 }
 
 export async function getSlackConfigForProject(projectId: string): Promise<SlackConfig | null> {
-  const supabase = createServiceClient()
-  const { data } = await supabase
-    .from('projects')
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    .select('slack_channel, slack_bot_token' as any)
-    .eq('id', projectId)
-    .single()
+  const rows = await query<{ slack_channel: string | null; slack_bot_token: string | null }>(
+    'SELECT slack_channel, slack_bot_token FROM projects WHERE id = $1',
+    [projectId],
+  )
+  const row = rows[0] ?? null
 
-  if (!data) return null
+  if (!row) return null
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const row       = data as any
   const channel   = typeof row.slack_channel   === 'string' ? row.slack_channel   : null
   const botToken  = typeof row.slack_bot_token === 'string' ? row.slack_bot_token : null
 

@@ -1,5 +1,5 @@
 import { inngest } from '@/lib/inngest/client'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 import {
   getRecentEvents,
   getOpenGroup,
@@ -7,7 +7,7 @@ import {
   updateAlertGroup,
   linkEventToGroup,
   type RecentEvent,
-} from '@/lib/supabase/queries'
+} from '@/lib/db/queries'
 import type { AlertReceivedPayload, GroupEventPayload } from '@/types/events'
 
 // ─── Pure logic (exported for unit tests) ────────────────────────────────────
@@ -133,11 +133,10 @@ function makeDefaultDeps(): DeduplicationDeps {
     updateAlertGroup,
     linkEventToGroup,
     async updateGroupScore(groupId, score) {
-      const supabase = createServiceClient()
-      await supabase
-        .from('alert_groups')
-        .update({ score, score_reason: 'flapping' })
-        .eq('id', groupId)
+      await query(
+        `UPDATE alert_groups SET score = $1, score_reason = $2 WHERE id = $3`,
+        [score, 'flapping', groupId],
+      )
     },
   }
 }

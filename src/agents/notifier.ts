@@ -1,7 +1,7 @@
 import { inngest } from '@/lib/inngest/client'
 import { anthropic } from '@/lib/claude/client'
 import { NOTIFIER_SYSTEM_PROMPT } from '@/lib/claude/prompts'
-import { createServiceClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db/client'
 import { WebClient } from '@slack/web-api'
 import { getSlackConfigForProject } from '@/lib/slack/client'
 import { resend } from '@/lib/resend/client'
@@ -297,26 +297,37 @@ export const notifier = inngest.createFunction(
 
     // Step 1 — Fetch group status, services, events, Slack channel and owner email
     const ctx: NotifierContext = await step.run('fetch-context', async () => {
-      const supabase = createServiceClient()
-      const [{ data: group }, slackCfg, { data: ownerRow }] = await Promise.all([
-        supabase.from('alert_groups').select('id, notified, snoozed_until, event_ids').eq('id', groupId).single(),
+      const [groupRow, slackCfg, ownerRow] = await Promise.all([
+        query<{ id: string; notified: boolean; snoozed_until: string | null; event_ids: string[] }>(
+          'SELECT id, notified, snoozed_until, event_ids FROM alert_groups WHERE id = $1',
+          [groupId],
+        ).then(r => r[0] ?? null),
         getSlackConfigForProject(projectId),
-        supabase.from('users').select('email').eq('project_id', projectId).eq('role', 'owner').single(),
+        query<{ email: string }>(
+          'SELECT email FROM users WHERE project_id = $1 AND role = $2 LIMIT 1',
+          [projectId, 'owner'],
+        ).then(r => r[0] ?? null),
       ])
 
-      if (!group) throw new Error(`Group ${groupId} not found`)
+      if (!groupRow) throw new Error(`Group ${groupId} not found`)
 
       const [servicesResult, eventsResult] = await Promise.all([
         affectedServices.length > 0
-          ? supabase.from('services').select('id, name, source, criticality, namespace').in('id', affectedServices)
-          : Promise.resolve({ data: [] }),
-        supabase.from('alert_events').select('id, severity, reason, message').in('id', (group.event_ids ?? []).slice(0, 10)).order('id', { ascending: false }),
+          ? query<{ id: string; name: string; source: string; criticality: number; namespace: string | null }>(
+              `SELECT id, name, source, criticality, namespace FROM services WHERE id = ANY($1::uuid[])`,
+              [affectedServices],
+            )
+          : Promise.resolve([]),
+        query<{ id: string; severity: string; reason: string; message: string | null }>(
+          `SELECT id, severity, reason, message FROM alert_events WHERE id = ANY($1::uuid[]) ORDER BY id DESC`,
+          [(groupRow.event_ids ?? []).slice(0, 10)],
+        ),
       ])
 
       return {
-        group:         { id: group.id, notified: group.notified, snoozed_until: group.snoozed_until, event_ids: group.event_ids ?? [] },
-        services:      (servicesResult.data ?? []) as NotifierContext['services'],
-        recentEvents:  (eventsResult.data ?? []) as NotifierContext['recentEvents'],
+        group:         { id: groupRow.id, notified: groupRow.notified, snoozed_until: groupRow.snoozed_until, event_ids: groupRow.event_ids ?? [] },
+        services:      servicesResult as NotifierContext['services'],
+        recentEvents:  eventsResult as NotifierContext['recentEvents'],
         slackChannel:  slackCfg?.channel  ?? null,
         slackBotToken: slackCfg?.botToken ?? null,
         ownerEmail:    ownerRow?.email ?? null,
@@ -334,8 +345,7 @@ export const notifier = inngest.createFunction(
     // No Slack AND no owner email — nothing to send
     if (!ctx.slackChannel && !ctx.ownerEmail) {
       await step.run('mark-notified-no-channel', async () => {
-        const supabase = createServiceClient()
-        await supabase.from('alert_groups').update({ notified: true }).eq('id', groupId)
+        await query('UPDATE alert_groups SET notified = true WHERE id = $1', [groupId])
       })
       console.warn(`[notifier] No Slack channel or owner email for project ${projectId} — skipping`)
       return { groupId, notified: false, skipped: true, skipReason: 'no slack channel or email' }
@@ -448,8 +458,7 @@ export const notifier = inngest.createFunction(
 
     // Step 4 — Mark group as notified in DB
     await step.run('mark-notified', async () => {
-      const supabase = createServiceClient()
-      await supabase.from('alert_groups').update({ notified: true }).eq('id', groupId)
+      await query('UPDATE alert_groups SET notified = true WHERE id = $1', [groupId])
     })
 
     return {
