@@ -1,4 +1,4 @@
-import { inngest } from '@/lib/inngest/client'
+import { getBoss, QUEUE } from '@/lib/queue/boss'
 import { anthropic } from '@/lib/claude/client'
 import { SCORER_SYSTEM_PROMPT } from '@/lib/claude/prompts'
 import { query } from '@/lib/db/client'
@@ -16,7 +16,7 @@ export interface ScorerResponse {
 // Re-export for consumers
 export type { GroupScoredPayload }
 
-interface ScorerContext {
+export interface ScorerContext {
   group: {
     id: string
     event_ids: string[]
@@ -196,118 +196,131 @@ export async function runScorer(
   return { groupId, score: scored.score, reason: scored.reason, confidence: scored.confidence }
 }
 
-// ─── Inngest function ─────────────────────────────────────────────────────────
+// ─── Job payloads ─────────────────────────────────────────────────────────────
 
-export const scorer = inngest.createFunction(
-  {
-    id:      'scorer',
-    name:    'Alert Scorer (Claude Haiku)',
-    triggers: [
-      { event: 'centinelai/group.created' },
-      { event: 'centinelai/group.updated' },
-    ],
-    // Debounce per groupId: if multiple group.updated events arrive within
-    // 2 minutes for the same group, only run Claude once.
-    debounce: { key: 'event.data.groupId', period: '2m' },
-    retries:  3,
-    timeouts: { finish: '10m' },
-  },
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async ({ event, step }: { event: { data: GroupEventPayload }; step: any }) => {
-    const payload = event.data
-    const { groupId, projectId, isNew, count, trend, reason } = payload
+export interface ScoreJobPayload {
+  projectId: string
+  groupId:   string
+  isNew:     boolean
+  count:     number
+  trend:     'rising' | 'falling' | 'stable'
+  reason:    string
+  flapping:  boolean
+  frequency: number
+}
 
-    // Step 1 — API key check (determines AI vs rule-based scoring)
-    const hasApiKey = !!process.env.ANTHROPIC_API_KEY
-    if (!hasApiKey) {
-      const score = getRuleBasedScore(reason)
-      return { groupId, score, reason: `[fallback] ${reason}`, confidence: 'low' as const }
-    }
+export interface CorrelateJobPayload {
+  projectId:  string
+  groupId:    string
+  score:      number
+  reason:     string
+  confidence: string
+  serviceIds: string[]
+}
 
-    // Step 2 — Fetch group context (services, incidents, recent deploys)
-    const ctx = await step.run('fetch-context', async () => {
-      const ago30min = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+// ─── Production wrapper (pg-boss handler) ─────────────────────────────────────
 
-      const [groupRow, incidents, deploys] = await Promise.all([
-        query<{ id: string; event_ids: string[]; service_ids: string[]; score: number | null; window_end: string | null }>(
-          'SELECT id, event_ids, service_ids, score, window_end FROM alert_groups WHERE id = $1',
-          [groupId],
-        ).then(r => r[0] ?? null),
-        query<{ title: string; severity: string; started_at: string }>(
-          'SELECT title, severity, started_at FROM incidents WHERE project_id = $1 ORDER BY started_at DESC LIMIT 5',
-          [projectId],
-        ),
-        query<{ project: string; branch: string | null; author: string | null; deployed_at: string }>(
-          'SELECT project, branch, author, deployed_at FROM deploys WHERE project_id = $1 AND deployed_at >= $2',
-          [projectId, ago30min],
-        ),
-      ])
+export async function runScoring(payload: ScoreJobPayload): Promise<void> {
+  const { projectId, groupId, isNew, count, trend, reason, flapping, frequency } = payload
 
-      if (!groupRow) throw new Error(`Group ${groupId} not found`)
-
-      const serviceIds = groupRow.service_ids ?? []
-      const services = serviceIds.length > 0
-        ? await query<{ name: string; criticality: number; source: string }>(
-            `SELECT name, criticality, source FROM services WHERE id = ANY($1::uuid[])`,
-            [serviceIds],
-          )
-        : []
-
-      return {
-        group:           { id: groupRow.id, event_ids: groupRow.event_ids ?? [], service_ids: groupRow.service_ids ?? [], score: groupRow.score, window_end: groupRow.window_end },
-        services:        services as ScorerContext['services'],
-        recentIncidents: incidents as ScorerContext['recentIncidents'],
-        recentDeploys:   deploys as ScorerContext['recentDeploys'],
-      }
-    })
-
-    // Cache check — skip Claude if group was already scored within the debounce window
-    if (!isNew && ctx.group.score !== null && ctx.group.window_end) {
-      const age = Date.now() - new Date(ctx.group.window_end).getTime()
-      if (age < 2 * 60 * 1000) {
-        return { groupId, score: ctx.group.score, reason: 'cached', confidence: 'high', skipped: true }
-      }
-    }
-
-    // Step 3 — Call Claude Haiku for risk scoring
-    const claudeResult = await step.run('call-claude', async () => {
-      const userMessage = buildUserMessage(
-        { groupId, projectId, isNew, count, trend, reason, flapping: false, frequency: count / 5 },
-        ctx
-      )
-      const response = await anthropic.messages.create({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 200,
-        system:     SCORER_SYSTEM_PROMPT,
-        messages:   [{ role: 'user', content: userMessage }],
-      })
-      const block = response.content[0]
-      return {
-        text:         block.type === 'text' ? block.text : '',
-        inputTokens:  response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-      }
-    })
-
-    console.log(`Scorer: ${claudeResult.inputTokens} in / ${claudeResult.outputTokens} out`)
-    const scored = parseScorerResponse(claudeResult.text, reason)
-
-    // Step 4 — Persist score
-    await step.run('update-score', async () => {
-      await query(
-        'UPDATE alert_groups SET score = $1, score_reason = $2 WHERE id = $3',
-        [scored.score, scored.reason, groupId],
-      )
-    })
-
-    // Emit downstream only when actionable
-    if (scored.score > 50) {
-      await step.sendEvent('emit-group-scored', {
-        name: 'centinelai/group.scored',
-        data: { groupId, projectId, score: scored.score, reason: scored.reason, confidence: scored.confidence, serviceIds: ctx.group.service_ids } as GroupScoredPayload,
-      })
-    }
-
-    return { groupId, score: scored.score, reason: scored.reason, confidence: scored.confidence }
+  // Idempotency + debounce check
+  const rows = await query<{ scored_at: string | null }>(
+    'SELECT scored_at FROM alert_groups WHERE id = $1 AND project_id = $2',
+    [groupId, projectId],
+  )
+  if (rows.length === 0) {
+    console.warn(`[scorer] group ${groupId} not found, skipping`)
+    return
   }
-)
+  // Debounce: skip re-scoring if scored <2 min ago (equiv. to Inngest debounce).
+  if (rows[0].scored_at !== null) {
+    const ageMs = Date.now() - new Date(rows[0].scored_at).getTime()
+    if (ageMs < 2 * 60 * 1000) {
+      console.log(`[scorer] group ${groupId} scored ${Math.round(ageMs / 1000)}s ago, debounce skip`)
+      return
+    }
+  }
+
+  await runScorer(
+    { groupId, projectId, isNew, count, trend, reason, flapping, frequency },
+    {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      checkAIAccess: async (_pid: string) => !!process.env.ANTHROPIC_API_KEY,
+
+      fetchContext: async (gId, pId) => {
+        const ago30min = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+        const [groupRow, incidents, deploys] = await Promise.all([
+          query<{ id: string; event_ids: string[]; service_ids: string[]; score: number | null; window_end: string | null }>(
+            'SELECT id, event_ids, service_ids, score, window_end FROM alert_groups WHERE id = $1',
+            [gId],
+          ).then(r => r[0] ?? null),
+          query<{ title: string; severity: string; started_at: string }>(
+            'SELECT title, severity, started_at FROM incidents WHERE project_id = $1 ORDER BY started_at DESC LIMIT 5',
+            [pId],
+          ),
+          query<{ project: string; branch: string | null; author: string | null; deployed_at: string }>(
+            'SELECT project, branch, author, deployed_at FROM deploys WHERE project_id = $1 AND deployed_at >= $2',
+            [pId, ago30min],
+          ),
+        ])
+        if (!groupRow) throw new Error(`Group ${gId} not found`)
+        const svcIds = groupRow.service_ids ?? []
+        const services = svcIds.length > 0
+          ? await query<{ name: string; criticality: number; source: string }>(
+              'SELECT name, criticality, source FROM services WHERE id = ANY($1::uuid[])',
+              [svcIds],
+            )
+          : []
+        return {
+          group: {
+            id: groupRow.id,
+            event_ids: groupRow.event_ids ?? [],
+            service_ids: groupRow.service_ids ?? [],
+            score: groupRow.score,
+            window_end: groupRow.window_end,
+          },
+          services:        services as ScorerContext['services'],
+          recentIncidents: incidents as ScorerContext['recentIncidents'],
+          recentDeploys:   deploys as ScorerContext['recentDeploys'],
+        }
+      },
+
+      callClaude: async (userMessage) => {
+        const response = await anthropic.messages.create({
+          model:      'claude-haiku-4-5-20251001',
+          max_tokens: 200,
+          system:     SCORER_SYSTEM_PROMPT,
+          messages:   [{ role: 'user', content: userMessage }],
+        })
+        const block = response.content[0]
+        return {
+          text:         block.type === 'text' ? block.text : '',
+          inputTokens:  response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+        }
+      },
+
+      updateGroupScore: async (gId, score, scoreReason) => {
+        await query(
+          'UPDATE alert_groups SET score = $1, score_reason = $2, scored_at = now() WHERE id = $3',
+          [score, scoreReason, gId],
+        )
+      },
+
+      sendGroupScored: async (scoredPayload) => {
+        if (scoredPayload.score <= 50) return
+        const boss = await getBoss()
+        await boss.send(QUEUE.CORRELATE, {
+          projectId:  scoredPayload.projectId,
+          groupId:    scoredPayload.groupId,
+          score:      scoredPayload.score,
+          reason:     scoredPayload.reason,
+          confidence: scoredPayload.confidence,
+          serviceIds: scoredPayload.serviceIds,
+        } satisfies CorrelateJobPayload)
+      },
+
+      logTokens: (input, output) => console.log(`[scorer] ${input} in / ${output} out`),
+    },
+  )
+}

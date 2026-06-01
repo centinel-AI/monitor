@@ -1,8 +1,10 @@
-import { inngest } from '@/lib/inngest/client'
+import { getBoss, QUEUE } from '@/lib/queue/boss'
 import { anthropic } from '@/lib/claude/client'
 import { CORRELATOR_SYSTEM_PROMPT } from '@/lib/claude/prompts'
 import { query } from '@/lib/db/client'
 import type { GroupScoredPayload, GroupCriticalPayload } from '@/types/events'
+import type { CorrelateJobPayload } from '@/agents/scorer'
+import type { NotifyJobPayload } from '@/agents/notifier'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -275,133 +277,93 @@ export async function runCorrelator(
   }
 }
 
-// ─── Inngest function ─────────────────────────────────────────────────────────
+// ─── Production wrapper (pg-boss handler) ─────────────────────────────────────
 
-export const correlator = inngest.createFunction(
-  {
-    id:       'correlator',
-    name:     'Alert Correlator (Claude Haiku)',
-    triggers: [{ event: 'centinelai/group.scored' }],
-    retries:  3,
-    timeouts: { finish: '10m' },
-  },
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async ({ event, step }: { event: { data: GroupScoredPayload }; step: any }) => {
-    const payload = event.data
-    const { groupId, projectId, score, reason, serviceIds } = payload
+export async function runCorrelation(payload: CorrelateJobPayload): Promise<void> {
+  const { projectId, groupId, score, reason, serviceIds } = payload
 
-    // Early exit for low-score groups — no steps needed
-    if (score <= 50) {
-      return { groupId, finalScore: score, correlated: false, skipped: true, skipReason: 'score <= 50' }
-    }
-
-    // Step 1 — Fetch current group to check dedup / already-correlated
-    const currentGroup = await step.run('fetch-group', async () => {
-      const rows = await query<RelatedGroupData>(
-        'SELECT id, event_ids, service_ids, score, score_reason, correlated, window_end FROM alert_groups WHERE id = $1',
-        [groupId],
-      )
-      return rows[0] ?? null
-    })
-
-    if (!currentGroup) {
-      return { groupId, finalScore: score, correlated: false, skipped: true, skipReason: 'group not found' }
-    }
-
-    if (shouldSkipCorrelation(currentGroup)) {
-      return { groupId, finalScore: currentGroup.score ?? score, correlated: true, skipped: true, skipReason: 'already correlated' }
-    }
-
-    // Step 2 — Fetch related groups from last 30 min
-    const relatedGroups: RelatedGroupData[] = await step.run('fetch-related-groups', async () => {
-      const ago30min = new Date(Date.now() - 30 * 60 * 1000).toISOString()
-      return query<RelatedGroupData>(
-        `SELECT id, event_ids, service_ids, score, score_reason, correlated, window_end
-         FROM alert_groups
-         WHERE project_id = $1 AND id != $2 AND score > 30
-           AND created_at >= $3 AND notified = false
-         ORDER BY score DESC`,
-        [projectId, groupId, ago30min],
-      )
-    })
-
-    // Step 3 — Fetch service names for all affected groups
-    const services: ServiceInfo[] = await step.run('fetch-services', async () => {
-      const allIds = Array.from(new Set([...serviceIds, ...relatedGroups.flatMap((g: RelatedGroupData) => g.service_ids ?? [])]))
-      if (allIds.length === 0) return [] as ServiceInfo[]
-      return query<ServiceInfo>(
-        `SELECT id, name, criticality, source FROM services WHERE id = ANY($1::uuid[])`,
-        [allIds],
-      )
-    })
-
-    const serviceMap   = new Map(services.map((s) => [s.id, s]))
-    const currentNames = serviceIds.map((id) => serviceMap.get(id)?.name ?? id)
-
-    // No related groups → bypass Claude
-    if (relatedGroups.length === 0) {
-      if (score > 70) {
-        await step.sendEvent('emit-group-critical-solo', {
-          name: 'centinelai/group.critical',
-          data: { groupId, projectId, finalScore: score, rootCause: reason, affectedServices: currentNames, correlated: false, relatedGroupIds: [] } as GroupCriticalPayload,
-        })
-      }
-      return { groupId, finalScore: score, correlated: false }
-    }
-
-    // Step 4 — Call Claude Haiku for correlation analysis
-    const claudeResult: { text: string; inputTokens: number; outputTokens: number } = await step.run('call-claude', async () => {
-      const relatedForPrompt = relatedGroups.map((g: RelatedGroupData) => ({
-        description:  g.score_reason,
-        score:        g.score,
-        eventCount:   g.event_ids.length,
-        serviceNames: (g.service_ids ?? []).map((id) => serviceMap.get(id)?.name ?? id),
-      }))
-      const prompt = buildCorrelationPrompt(
-        { reason, score, eventCount: currentGroup.event_ids.length, serviceNames: currentNames },
-        relatedForPrompt
-      )
-      const response = await anthropic.messages.create({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 300,
-        system:     CORRELATOR_SYSTEM_PROMPT,
-        messages:   [{ role: 'user', content: prompt }],
-      })
-      const block = response.content[0]
-      return {
-        text:         block.type === 'text' ? block.text : '',
-        inputTokens:  response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-      }
-    })
-
-    console.log(`[correlator] ${claudeResult.inputTokens} in / ${claudeResult.outputTokens} out`)
-    const correlation = parseCorrelationResponse(claudeResult.text, { score, reason })
-
-    // Step 5 — Persist correlation result if groups are related
-    let finalScore = score
-    if (correlation.correlated) {
-      finalScore = correlation.combined_score
-      await step.run('update-correlated', async () => {
-        await query(
-          'UPDATE alert_groups SET score = $1, score_reason = $2, correlated = true WHERE id = $3',
-          [finalScore, correlation.root_cause, groupId],
-        )
-      })
-      console.log(`[correlator] Correlated ${relatedGroups.length + 1} groups. Combined score: ${finalScore}`)
-    }
-
-    // Emit group.critical if above actionable threshold
-    if (finalScore > 70) {
-      const affectedNames = correlation.affected_services.length > 0 ? correlation.affected_services : currentNames
-      await step.sendEvent('emit-group-critical', {
-        name: 'centinelai/group.critical',
-        data: { groupId, projectId, finalScore, rootCause: correlation.root_cause, affectedServices: affectedNames, correlated: correlation.correlated, relatedGroupIds: relatedGroups.map((g) => g.id) } as GroupCriticalPayload,
-      })
-    } else {
-      console.log(`[correlator] Score ${finalScore} below notification threshold. Archived.`)
-    }
-
-    return { groupId, finalScore, correlated: correlation.correlated, confidence: correlation.confidence }
+  // Idempotency: skip if already correlated
+  const rows = await query<{ correlated_at: string | null }>(
+    'SELECT correlated_at FROM alert_groups WHERE id = $1 AND project_id = $2',
+    [groupId, projectId],
+  )
+  if (rows.length === 0) {
+    console.warn(`[correlator] group ${groupId} not found, skipping`)
+    return
   }
-)
+  if (rows[0].correlated_at !== null) {
+    console.log(`[correlator] group ${groupId} already correlated, skipping`)
+    return
+  }
+
+  await runCorrelator(
+    { groupId, projectId, score, reason, confidence: payload.confidence, serviceIds },
+    {
+      fetchCurrentGroup: async (gId) => {
+        const r = await query<RelatedGroupData>(
+          'SELECT id, event_ids, service_ids, score, score_reason, correlated, window_end FROM alert_groups WHERE id = $1',
+          [gId],
+        )
+        return r[0] ?? null
+      },
+
+      fetchRelatedGroups: async (pId, currentGroupId) => {
+        const ago30min = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+        return query<RelatedGroupData>(
+          `SELECT id, event_ids, service_ids, score, score_reason, correlated, window_end
+           FROM alert_groups
+           WHERE project_id = $1 AND id != $2 AND score > 30
+             AND created_at >= $3 AND notified = false
+           ORDER BY score DESC`,
+          [pId, currentGroupId, ago30min],
+        )
+      },
+
+      fetchServicesForIds: async (ids) => {
+        if (ids.length === 0) return []
+        return query<ServiceInfo>(
+          'SELECT id, name, criticality, source FROM services WHERE id = ANY($1::uuid[])',
+          [ids],
+        )
+      },
+
+      callClaude: async (prompt) => {
+        const response = await anthropic.messages.create({
+          model:      'claude-haiku-4-5-20251001',
+          max_tokens: 300,
+          system:     CORRELATOR_SYSTEM_PROMPT,
+          messages:   [{ role: 'user', content: prompt }],
+        })
+        const block = response.content[0]
+        return {
+          text:         block.type === 'text' ? block.text : '',
+          inputTokens:  response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+        }
+      },
+
+      updateGroupCorrelated: async (gId, finalScore, rootCause) => {
+        await query(
+          'UPDATE alert_groups SET score = $1, score_reason = $2, correlated = true, correlated_at = now() WHERE id = $3',
+          [finalScore, rootCause, gId],
+        )
+      },
+
+      sendGroupCritical: async (critPayload) => {
+        if (critPayload.finalScore <= 70) return
+        const boss = await getBoss()
+        await boss.send(QUEUE.NOTIFY, {
+          projectId:        critPayload.projectId,
+          groupId:          critPayload.groupId,
+          finalScore:       critPayload.finalScore,
+          rootCause:        critPayload.rootCause,
+          affectedServices: critPayload.affectedServices,
+          correlated:       critPayload.correlated,
+          relatedGroupIds:  critPayload.relatedGroupIds,
+        } satisfies NotifyJobPayload)
+      },
+
+      logTokens: (input, output) => console.log(`[correlator] ${input} in / ${output} out`),
+    },
+  )
+}

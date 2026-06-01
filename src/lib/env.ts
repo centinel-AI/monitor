@@ -1,8 +1,6 @@
 const requiredEnvVars = [
   'MONITOR_POSTGRES_URL',
   'ANTHROPIC_API_KEY',
-  'INNGEST_EVENT_KEY',
-  'INNGEST_SIGNING_KEY',
   'NEXT_PUBLIC_APP_URL',
 ] as const
 

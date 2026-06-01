@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { requireAuth } from '@/lib/auth'
 import { query } from '@/lib/db/client'
-import { generatePostmortem } from '@/agents/postmortem'
+import { getBoss, QUEUE } from '@/lib/queue/boss'
+import type { PostmortemJobPayload } from '@/agents/postmortem'
 
 // ─── GET /api/incidents/[id]/postmortem ───────────────────────────────────────
 
@@ -74,10 +75,14 @@ export async function POST(
   }
 
   try {
-    const postmortem = await generatePostmortem(id)
-    return NextResponse.json({ postmortem, generated: true })
+    const boss = await getBoss()
+    await boss.send(QUEUE.POSTMORTEM, {
+      projectId:  profile.project_id,
+      incidentId: id,
+    } satisfies PostmortemJobPayload)
+    return NextResponse.json({ queued: true }, { status: 202 })
   } catch (err) {
     console.error('[postmortem route] error:', err)
-    return NextResponse.json({ error: 'Failed to generate postmortem' }, { status: 500 })
+    return NextResponse.json({ error: 'Failed to queue postmortem generation' }, { status: 500 })
   }
 }

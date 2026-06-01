@@ -1,12 +1,8 @@
-import { inngest } from '@/lib/inngest/client'
 import { anthropic } from '@/lib/claude/client'
 import { NOTIFIER_SYSTEM_PROMPT } from '@/lib/claude/prompts'
 import { query } from '@/lib/db/client'
-import { WebClient } from '@slack/web-api'
 import { getSlackConfigForProject } from '@/lib/slack/client'
-import { resend } from '@/lib/resend/client'
 import { getScoreLabel } from '@/lib/dashboard-stats'
-import type { Block, KnownBlock } from '@slack/web-api'
 import type { GroupCriticalPayload } from '@/types/events'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -280,192 +276,112 @@ export async function runNotifier(
   }
 }
 
-// ─── Inngest function ─────────────────────────────────────────────────────────
+// ─── Job payload ──────────────────────────────────────────────────────────────
 
-export const notifier = inngest.createFunction(
-  {
-    id:       'notifier',
-    name:     'Alert Notifier (Claude Sonnet)',
-    triggers: [{ event: 'centinelai/group.critical' }],
-    retries:  3,
-    timeouts: { finish: '10m' },
-  },
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async ({ event, step }: { event: { data: GroupCriticalPayload }; step: any }) => {
-    const payload = event.data
-    const { groupId, projectId, finalScore, rootCause, affectedServices, correlated, relatedGroupIds } = payload
+export interface NotifyJobPayload {
+  projectId:       string
+  groupId:         string
+  finalScore:      number
+  rootCause:       string
+  affectedServices: string[]
+  correlated:      boolean
+  relatedGroupIds: string[]
+}
 
-    // Step 1 — Fetch group status, services, events, Slack channel and owner email
-    const ctx: NotifierContext = await step.run('fetch-context', async () => {
-      const [groupRow, slackCfg, ownerRow] = await Promise.all([
-        query<{ id: string; notified: boolean; snoozed_until: string | null; event_ids: string[] }>(
-          'SELECT id, notified, snoozed_until, event_ids FROM alert_groups WHERE id = $1',
-          [groupId],
-        ).then(r => r[0] ?? null),
-        getSlackConfigForProject(projectId),
-        query<{ email: string }>(
-          'SELECT email FROM users WHERE project_id = $1 AND role = $2 LIMIT 1',
-          [projectId, 'owner'],
-        ).then(r => r[0] ?? null),
-      ])
+// ─── Production wrapper (pg-boss handler) ─────────────────────────────────────
 
-      if (!groupRow) throw new Error(`Group ${groupId} not found`)
+export async function runNotify(payload: NotifyJobPayload): Promise<void> {
+  const { projectId, groupId, finalScore, rootCause, affectedServices, correlated, relatedGroupIds } = payload
 
-      const [servicesResult, eventsResult] = await Promise.all([
-        affectedServices.length > 0
-          ? query<{ id: string; name: string; source: string; criticality: number; namespace: string | null }>(
-              `SELECT id, name, source, criticality, namespace FROM services WHERE id = ANY($1::uuid[])`,
-              [affectedServices],
-            )
-          : Promise.resolve([]),
-        query<{ id: string; severity: string; reason: string; message: string | null }>(
-          `SELECT id, severity, reason, message FROM alert_events WHERE id = ANY($1::uuid[]) ORDER BY id DESC`,
-          [(groupRow.event_ids ?? []).slice(0, 10)],
-        ),
-      ])
-
-      return {
-        group:         { id: groupRow.id, notified: groupRow.notified, snoozed_until: groupRow.snoozed_until, event_ids: groupRow.event_ids ?? [] },
-        services:      servicesResult as NotifierContext['services'],
-        recentEvents:  eventsResult as NotifierContext['recentEvents'],
-        slackChannel:  slackCfg?.channel  ?? null,
-        slackBotToken: slackCfg?.botToken ?? null,
-        ownerEmail:    ownerRow?.email ?? null,
-      } as NotifierContext
-    })
-
-    // Skip checks — no DB writes yet, so safe to exit early
-    if (ctx.group.notified) {
-      return { groupId, notified: false, skipped: true, skipReason: 'already notified' }
-    }
-    if (ctx.group.snoozed_until && new Date(ctx.group.snoozed_until) > new Date()) {
-      return { groupId, notified: false, skipped: true, skipReason: 'snoozed' }
-    }
-
-    // No Slack AND no owner email — nothing to send
-    if (!ctx.slackChannel && !ctx.ownerEmail) {
-      await step.run('mark-notified-no-channel', async () => {
-        await query('UPDATE alert_groups SET notified = true WHERE id = $1', [groupId])
-      })
-      console.warn(`[notifier] No Slack channel or owner email for project ${projectId} — skipping`)
-      return { groupId, notified: false, skipped: true, skipReason: 'no slack channel or email' }
-    }
-
-    // Step 2 — Call Claude Sonnet to generate human-readable summary
-    const claudeResult: { text: string; inputTokens: number; outputTokens: number } = await step.run('call-claude', async () => {
-      const contextStr = buildNotifierContext(
-        { groupId, projectId, finalScore, rootCause, affectedServices, correlated, relatedGroupIds },
-        ctx
-      )
-      const response = await anthropic.messages.create({
-        model:      'claude-sonnet-4-5',
-        max_tokens: 500,
-        system:     NOTIFIER_SYSTEM_PROMPT,
-        messages:   [{ role: 'user', content: contextStr }],
-      })
-      const block = response.content[0]
-      return {
-        text:         block.type === 'text' ? block.text : '',
-        inputTokens:  response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-      }
-    })
-
-    console.log(`[notifier] ${claudeResult.inputTokens} in / ${claudeResult.outputTokens} out`)
-    const parsed     = parseNotifierResponse(claudeResult.text, { rootCause, serviceCount: ctx.services.length })
-    const scoreEmoji = finalScore >= 90 ? '🔴' : finalScore >= 70 ? '🟠' : '🟡'
-    const scoreLabel = finalScore >= 90 ? 'CRITICAL' : finalScore >= 70 ? 'HIGH' : 'MEDIUM'
-
-    // Step 3a — Send Slack message (preferred)
-    if (ctx.slackChannel) {
-      const serviceNames = (ctx.services as NotifierContext['services']).map((s) => s.name)
-      const blocks       = buildSlackBlocks(payload, parsed, serviceNames)
-      await step.run('send-slack', async () => {
-        const slackClient = new WebClient(ctx.slackBotToken!)
-        await slackClient.chat.postMessage({
-          channel: ctx.slackChannel!,
-          blocks:  blocks as (KnownBlock | Block)[],
-          text:    `${scoreEmoji} ${scoreLabel}: ${parsed.summary}`,
-        })
-      })
-      console.log(`[notifier] Slack: group ${groupId} score ${finalScore} → #${ctx.slackChannel}`)
-    } else {
-      // Step 3b — Email fallback when Slack is not configured
-      await step.run('send-email', async () => {
-        const appUrl       = process.env.NEXT_PUBLIC_APP_URL ?? 'https://app.centinelai.com'
-        const emailLabel   = finalScore >= 90 ? 'CRITICAL' : finalScore >= 70 ? 'HIGH' : 'MEDIUM'
-        const serviceList  = (ctx.services as NotifierContext['services']).map((s) => s.name).join(', ') || 'unknown'
-        await resend.emails.send({
-          from:    'centinelAI <alerts@centinelai.io>',
-          to:      ctx.ownerEmail!,
-          subject: `${scoreEmoji} ${emailLabel} — ${parsed.summary}`,
-          html: `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; }
-    .header { background: #5B4FCF; color: white; padding: 24px; border-radius: 8px 8px 0 0; }
-    .header h1 { margin: 0; font-size: 18px; }
-    .score-badge { display: inline-block; background: rgba(255,255,255,0.2); padding: 4px 12px; border-radius: 20px; font-size: 14px; margin-top: 8px; }
-    .body { background: #f8f9ff; padding: 24px; border: 1px solid #e0dfff; }
-    .field { margin-bottom: 16px; }
-    .field-label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
-    .field-value { font-size: 15px; color: #1A1A2E; margin-top: 4px; }
-    .actions { background: white; border: 1px solid #e0dfff; border-radius: 8px; padding: 16px; margin-top: 16px; }
-    .actions h3 { margin: 0 0 12px; font-size: 14px; color: #5B4FCF; }
-    .actions ol { margin: 0; padding-left: 20px; }
-    .actions li { font-size: 14px; color: #444; margin-bottom: 8px; }
-    .cta { display: block; background: #5B4FCF; color: white; text-align: center; padding: 12px; border-radius: 8px; text-decoration: none; margin-top: 20px; font-weight: bold; }
-    .footer { background: #1A1A2E; color: #888; padding: 16px 24px; border-radius: 0 0 8px 8px; font-size: 12px; text-align: center; }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <div style="font-size:12px;opacity:0.7;margin-bottom:8px">centinel<strong>AI</strong></div>
-    <h1>${scoreEmoji} ${parsed.summary}</h1>
-    <div class="score-badge">Score: ${finalScore}/100 · ${emailLabel}</div>
-  </div>
-  <div class="body">
-    <div class="field">
-      <div class="field-label">Impact</div>
-      <div class="field-value">${parsed.impact}</div>
-    </div>
-    <div class="field">
-      <div class="field-label">Probable cause</div>
-      <div class="field-value">${parsed.likely_cause}</div>
-    </div>
-    <div class="field">
-      <div class="field-label">Affected services</div>
-      <div class="field-value">${serviceList}</div>
-    </div>
-    <div class="actions">
-      <h3>Recommended actions</h3>
-      <ol>${parsed.actions.map((a) => `<li>${a}</li>`).join('')}</ol>
-    </div>
-    <a href="${appUrl}/dashboard" class="cta">View dashboard →</a>
-  </div>
-  <div class="footer">
-    centinelAI · ${new Date().toISOString()} ·
-    <a href="${appUrl}/billing" style="color:#5B4FCF">Manage notifications</a>
-  </div>
-</body>
-</html>`,
-        })
-      })
-      console.log(`[notifier] Email: group ${groupId} score ${finalScore} → ${ctx.ownerEmail}`)
-    }
-
-    // Step 4 — Mark group as notified in DB
-    await step.run('mark-notified', async () => {
-      await query('UPDATE alert_groups SET notified = true WHERE id = $1', [groupId])
-    })
-
-    return {
-      groupId,
-      notified: true,
-      channel:  ctx.slackChannel ?? undefined,
-      email:    ctx.slackChannel ? undefined : ctx.ownerEmail ?? undefined,
-    }
+  // Idempotency: skip if already notified
+  const rows = await query<{ notified_at: string | null }>(
+    'SELECT notified_at FROM alert_groups WHERE id = $1 AND project_id = $2',
+    [groupId, projectId],
+  )
+  if (rows.length === 0) {
+    console.warn(`[notifier] group ${groupId} not found, skipping`)
+    return
   }
-)
+  if (rows[0].notified_at !== null) {
+    console.log(`[notifier] group ${groupId} already notified, skipping`)
+    return
+  }
+
+  await runNotifier(
+    { groupId, projectId, finalScore, rootCause, affectedServices, correlated, relatedGroupIds },
+    {
+      fetchContext: async (gId, pId, affectedSvcIds) => {
+        const [groupRow, slackCfg, ownerRow] = await Promise.all([
+          query<{ id: string; notified: boolean; snoozed_until: string | null; event_ids: string[] }>(
+            'SELECT id, notified, snoozed_until, event_ids FROM alert_groups WHERE id = $1',
+            [gId],
+          ).then(r => r[0] ?? null),
+          getSlackConfigForProject(pId),
+          query<{ email: string }>(
+            'SELECT email FROM users WHERE project_id = $1 AND role = $2 LIMIT 1',
+            [pId, 'owner'],
+          ).then(r => r[0] ?? null),
+        ])
+        if (!groupRow) throw new Error(`Group ${gId} not found`)
+        const [servicesResult, eventsResult] = await Promise.all([
+          affectedSvcIds.length > 0
+            ? query<{ id: string; name: string; source: string; criticality: number; namespace: string | null }>(
+                'SELECT id, name, source, criticality, namespace FROM services WHERE id = ANY($1::uuid[])',
+                [affectedSvcIds],
+              )
+            : Promise.resolve([]),
+          query<{ id: string; severity: string; reason: string; message: string | null }>(
+            'SELECT id, severity, reason, message FROM alert_events WHERE id = ANY($1::uuid[]) ORDER BY id DESC',
+            [(groupRow.event_ids ?? []).slice(0, 10)],
+          ),
+        ])
+        return {
+          group:         { id: groupRow.id, notified: groupRow.notified, snoozed_until: groupRow.snoozed_until, event_ids: groupRow.event_ids ?? [] },
+          services:      servicesResult as NotifierContext['services'],
+          recentEvents:  eventsResult as NotifierContext['recentEvents'],
+          slackChannel:  slackCfg?.channel  ?? null,
+          slackBotToken: slackCfg?.botToken ?? null,
+          ownerEmail:    ownerRow?.email ?? null,
+        } as NotifierContext
+      },
+
+      callClaude: async (contextStr) => {
+        const response = await anthropic.messages.create({
+          model:      'claude-sonnet-4-5',
+          max_tokens: 500,
+          system:     NOTIFIER_SYSTEM_PROMPT,
+          messages:   [{ role: 'user', content: contextStr }],
+        })
+        const block = response.content[0]
+        return {
+          text:         block.type === 'text' ? block.text : '',
+          inputTokens:  response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens,
+        }
+      },
+
+      sendSlack: async (channel, blocks, fallbackText) => {
+        const slackRows = await query<{ notified: boolean; snoozed_until: string | null }>(
+          'SELECT notified, snoozed_until FROM alert_groups WHERE id = $1',
+          [groupId],
+        )
+        const botToken = slackRows.length > 0
+          ? (await getSlackConfigForProject(projectId))?.botToken
+          : null
+        if (!botToken) return
+        const { WebClient } = await import('@slack/web-api')
+        const slackClient = new WebClient(botToken)
+        await slackClient.chat.postMessage({ channel, blocks: blocks as import('@slack/web-api').Block[], text: fallbackText })
+      },
+
+      markGroupNotified: async (gId) => {
+        await query(
+          'UPDATE alert_groups SET notified = true, notified_at = now() WHERE id = $1',
+          [gId],
+        )
+      },
+
+      logTokens: (input, output) => console.log(`[notifier] ${input} in / ${output} out`),
+    },
+  )
+}

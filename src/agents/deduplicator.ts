@@ -1,4 +1,4 @@
-import { inngest } from '@/lib/inngest/client'
+import { getBoss, QUEUE } from '@/lib/queue/boss'
 import { query } from '@/lib/db/client'
 import {
   getRecentEvents,
@@ -8,7 +8,8 @@ import {
   linkEventToGroup,
   type RecentEvent,
 } from '@/lib/db/queries'
-import type { AlertReceivedPayload, GroupEventPayload } from '@/types/events'
+import type { AlertReceivedPayload } from '@/types/events'
+import type { ScoreJobPayload } from '@/agents/scorer'
 
 // ─── Pure logic (exported for unit tests) ────────────────────────────────────
 
@@ -123,93 +124,72 @@ export async function runDeduplication(
   return { groupId, isNew, count: recentEvents.length, trend, flapping: isFlapping, frequency }
 }
 
-// ─── Default deps (production) ────────────────────────────────────────────────
+// ─── Job payload ──────────────────────────────────────────────────────────────
 
-function makeDefaultDeps(): DeduplicationDeps {
-  return {
+export interface DedupJobPayload {
+  projectId:  string
+  eventId:    string
+  reason:     string
+  source:     string
+  severity:   string
+  score:      number | null
+  serviceId:  string | null
+  timestamp:  string
+}
+
+// ─── Production wrapper (pg-boss handler) ─────────────────────────────────────
+
+export async function runDedup(payload: DedupJobPayload): Promise<void> {
+  const { projectId, eventId, reason, source, severity, score, serviceId, timestamp } = payload
+
+  // Idempotency: skip if event already linked to a group
+  const eventRows = await query<{ grouped_id: string | null }>(
+    'SELECT grouped_id FROM alert_events WHERE id = $1',
+    [eventId],
+  )
+  if (eventRows.length === 0) {
+    console.warn(`[dedup] event ${eventId} not found, skipping`)
+    return
+  }
+  if (eventRows[0].grouped_id !== null) {
+    console.log(`[dedup] event ${eventId} already grouped, skipping`)
+    return
+  }
+
+  const alertPayload: AlertReceivedPayload = {
+    eventId,
+    projectId,
+    serviceId,
+    source:   source as AlertReceivedPayload['source'],
+    reason,
+    severity: severity as AlertReceivedPayload['severity'],
+    score,
+    timestamp,
+  }
+
+  const result = await runDeduplication(alertPayload, {
     getRecentEvents,
     getOpenGroup,
     createAlertGroup,
     updateAlertGroup,
     linkEventToGroup,
-    async updateGroupScore(groupId, score) {
+    async updateGroupScore(groupId, groupScore) {
       await query(
-        `UPDATE alert_groups SET score = $1, score_reason = $2 WHERE id = $3`,
-        [score, 'flapping', groupId],
+        'UPDATE alert_groups SET score = $1, score_reason = $2 WHERE id = $3',
+        [groupScore, 'flapping', groupId],
       )
     },
-  }
+  })
+
+  const boss = await getBoss()
+  await boss.send(QUEUE.SCORE, {
+    projectId,
+    groupId:   result.groupId,
+    isNew:     result.isNew,
+    count:     result.count,
+    trend:     result.trend,
+    reason,
+    flapping:  result.flapping,
+    frequency: result.frequency,
+  } satisfies ScoreJobPayload)
 }
-
-// ─── Inngest function ─────────────────────────────────────────────────────────
-
-export const deduplicator = inngest.createFunction(
-  {
-    id:       'deduplicator',
-    name:     'Alert Deduplicator',
-    triggers: [{ event: 'centinelai/alert.received' }],
-    retries:  3,
-    timeouts: { finish: '10m' },
-  },
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async ({ event, step }: { event: { data: AlertReceivedPayload }; step: any }) => {
-    const data = event.data
-
-    // Step 1 — Fetch event windows for flapping/trend analysis
-    const { recentEvents, prevCount } = await step.run('fetch-events', async () => {
-      const deps = makeDefaultDeps()
-      const [recent, prev] = await Promise.all([
-        deps.getRecentEvents(data.projectId, data.reason, 5),
-        deps.getRecentEvents(data.projectId, data.reason, 10),
-      ])
-      return { recentEvents: recent, prevCount: prev.length - recent.length }
-    })
-
-    // Step 2 — Find existing open group or create a new one
-    const { groupId, isNew, isFlapping } = await step.run('find-or-create-group', async () => {
-      const deps    = makeDefaultDeps()
-      const flapping = detectFlapping(recentEvents)
-      const openGroup = await deps.getOpenGroup(data.projectId, data.reason)
-
-      if (openGroup) {
-        await deps.updateAlertGroup(openGroup.id, data.eventId, data.serviceId ?? undefined)
-        return { groupId: openGroup.id, isNew: false, isFlapping: flapping }
-      }
-
-      const created = await deps.createAlertGroup({
-        projectId:  data.projectId,
-        serviceIds: data.serviceId ? [data.serviceId] : [],
-        eventIds:   [data.eventId],
-      })
-      return { groupId: created.id, isNew: true, isFlapping: flapping }
-    })
-
-    // Step 3 — Link event to group; apply flapping score penalty if needed
-    await step.run('link-event', async () => {
-      const deps = makeDefaultDeps()
-      await deps.linkEventToGroup(data.eventId, groupId)
-      if (isFlapping) {
-        await deps.updateGroupScore(groupId, Math.round((data.score ?? 50) / 2))
-      }
-    })
-
-    const trend     = calculateTrend(recentEvents.length, prevCount)
-    const frequency = recentEvents.length / 5
-
-    await step.sendEvent('emit-group-event', {
-      name: isNew ? 'centinelai/group.created' : 'centinelai/group.updated',
-      data: {
-        groupId,
-        projectId: data.projectId,
-        isNew,
-        count:     recentEvents.length,
-        trend,
-        reason:    data.reason,
-        flapping:  isFlapping,
-        frequency,
-      } as GroupEventPayload,
-    })
-
-    return { groupId, isNew, count: recentEvents.length, trend, flapping: isFlapping, frequency }
-  }
-)

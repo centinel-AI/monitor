@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { query } from '@/lib/db/client'
-import { inngest } from '@/lib/inngest/client'
+import { getBoss, QUEUE } from '@/lib/queue/boss'
+import type { DedupJobPayload } from '@/agents/deduplicator'
 import { rateLimit } from '@/lib/rate-limit'
 import { normalizeKubernetes } from '../_normalizers/kubernetes'
 import { normalizeGitlab, normalizeGitLabEvent } from '../_normalizers/gitlab'
@@ -94,19 +95,17 @@ export async function POST(
 
         if (saved) {
           eventIds.push(saved.id)
-          await inngest.send({
-            name: 'centinelai/alert.received',
-            data: {
-              eventId:   saved.id,
-              projectId: alert.projectId,
-              serviceId: alert.serviceId ?? null,
-              source:    alert.source,
-              reason:    alert.reason,
-              severity:  alert.severity,
-              score:     alert.score ?? null,
-              timestamp: alert.timestamp,
-            },
-          })
+          const boss = await getBoss()
+          await boss.send(QUEUE.DEDUP, {
+            projectId: alert.projectId,
+            eventId:   saved.id,
+            reason:    alert.reason,
+            source:    alert.source,
+            severity:  alert.severity,
+            score:     alert.score ?? null,
+            serviceId: alert.serviceId ?? null,
+            timestamp: alert.timestamp,
+          } satisfies DedupJobPayload)
         }
       }
 
@@ -142,19 +141,17 @@ export async function POST(
 
       eventIds.push(saved.id)
 
-      await inngest.send({
-        name: 'centinelai/alert.received',
-        data: {
-          eventId:   saved.id,
-          projectId: alert.projectId,
-          serviceId: serviceId,
-          source:    alert.source,
-          reason:    alert.reason,
-          severity:  alert.severity,
-          score:     alert.score ?? null,
-          timestamp: alert.timestamp,
-        },
-      })
+      const boss = await getBoss()
+      await boss.send(QUEUE.DEDUP, {
+        projectId: alert.projectId,
+        eventId:   saved.id,
+        reason:    alert.reason,
+        source:    alert.source,
+        severity:  alert.severity,
+        score:     alert.score ?? null,
+        serviceId: serviceId ?? null,
+        timestamp: alert.timestamp,
+      } satisfies DedupJobPayload)
     }
 
     return NextResponse.json({ received: true, eventIds })

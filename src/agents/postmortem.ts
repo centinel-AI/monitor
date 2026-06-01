@@ -190,3 +190,22 @@ Generate a complete blameless postmortem in Spanish.
 
   return markdownText
 }
+
+// ─── Job payload ──────────────────────────────────────────────────────────────
+
+export interface PostmortemJobPayload {
+  projectId:  string
+  incidentId: string
+}
+
+// ─── Production wrapper (pg-boss handler) ─────────────────────────────────────
+
+export async function runPostmortem(payload: PostmortemJobPayload): Promise<void> {
+  const { incidentId } = payload
+  try {
+    await generatePostmortem(incidentId)
+  } catch (e) {
+    console.error(`[postmortem] failed for incident ${incidentId}`, e)
+    throw e
+  }
+}
