@@ -174,9 +174,9 @@ export async function getServicesForGroups(groups: AlertGroup[]): Promise<Servic
  */
 export async function getProjectByToken(
   token: string
-): Promise<{ id: string; name: string; plan: string } | null> {
-  const rows = await query<{ id: string; name: string; plan: string }>(
-    'SELECT id, name, plan FROM projects WHERE api_token = $1',
+): Promise<{ id: string; name: string } | null> {
+  const rows = await query<{ id: string; name: string }>(
+    'SELECT id, name FROM projects WHERE api_token = $1',
     [token],
   )
   return rows[0] ?? null
