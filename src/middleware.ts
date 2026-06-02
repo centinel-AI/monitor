@@ -14,6 +14,11 @@ const SELF_AUTH_PATHS = [
   '/api/slack/actions', // Slack signing secret
 ]
 
+// Global endpoints: require X-Service-Token but NOT X-Grauss-Project-Id
+// (they are not per-project). Exact match so descendants like
+// /api/v1/sources/verify stay project-scoped. (M.2.h)
+const PROJECT_ID_OPTIONAL_PATHS = new Set<string>(['/api/v1/sources'])
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 function isPublic(path: string): boolean {
@@ -39,6 +44,11 @@ export function middleware(req: NextRequest) {
   const token = req.headers.get('x-service-token')
   if (!token || token !== expected) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
+  }
+
+  // Global endpoints stop here: token validated, no project-id needed.
+  if (PROJECT_ID_OPTIONAL_PATHS.has(pathname)) {
+    return NextResponse.next()
   }
 
   const projectId = req.headers.get('x-grauss-project-id')

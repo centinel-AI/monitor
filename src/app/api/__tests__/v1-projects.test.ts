@@ -62,6 +62,13 @@ describe('GET /api/v1/projects/[projectId]', () => {
     expect(res.status).toBe(200)
   })
 
+  it('exposes apiToken in the response (M.2.h)', async () => {
+    mockQuery.mockResolvedValueOnce([{ id: PROJECT_ID, name: 'test', api_token: 'tok-abc-123' }])
+    const res = await GET(makeGetReq(), { params })
+    const body = await res.json() as { apiToken?: string }
+    expect(body.apiToken).toBe('tok-abc-123')
+  })
+
   it('returns 404 when not found', async () => {
     mockQuery.mockResolvedValueOnce([])
     const res = await GET(makeGetReq(), { params })

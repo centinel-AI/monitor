@@ -13,8 +13,8 @@ export async function GET(
     return NextResponse.json({ error: 'projectId mismatch' }, { status: 400 })
   }
 
-  const rows = await query<{ id: string; name: string }>(
-    'SELECT id, name FROM projects WHERE id = $1',
+  const rows = await query<{ id: string; name: string; api_token: string }>(
+    'SELECT id, name, api_token FROM projects WHERE id = $1',
     [paramId],
   )
 
@@ -22,7 +22,7 @@ export async function GET(
     return NextResponse.json({ error: 'not found' }, { status: 404 })
   }
 
-  return NextResponse.json({ projectId: rows[0].id, name: rows[0].name })
+  return NextResponse.json({ projectId: rows[0].id, name: rows[0].name, apiToken: rows[0].api_token })
 }
 
 export async function DELETE(

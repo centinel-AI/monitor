@@ -67,4 +67,22 @@ describe('middleware', () => {
     const ct = res.headers.get('content-type')
     expect(ct === null || !ct.includes('application/json')).toBe(true)
   })
+
+  // M.2.h: /api/v1/sources is a global catalog — token required, project-id exempt.
+  it('passes /api/v1/sources with token but no project-id', () => {
+    const res = middleware(req('/api/v1/sources', { 'x-service-token': TOKEN }))
+    expect(res.status).not.toBe(400)
+    const ct = res.headers.get('content-type')
+    expect(ct === null || !ct.includes('application/json')).toBe(true)
+  })
+
+  it('still rejects /api/v1/sources without token', async () => {
+    const res = middleware(req('/api/v1/sources'))
+    expect(res.status).toBe(401)
+  })
+
+  it('keeps /api/v1/sources/verify project-scoped (400 without project-id)', async () => {
+    const res = middleware(req('/api/v1/sources/verify', { 'x-service-token': TOKEN }))
+    expect(res.status).toBe(400)
+  })
 })
