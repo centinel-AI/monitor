@@ -9,7 +9,7 @@ export async function GET(): Promise<NextResponse> {
   const settings = await getProjectSettings(projectId)
 
   return NextResponse.json(
-    settings ?? { llmProvider: null, llmModel: null, llmApiKeyConfigured: false }
+    settings ?? { llmProvider: null, llmModel: null, llmApiKeyConfigured: false, apiKeyConfiguredAt: null }
   )
 }
 
@@ -34,7 +34,10 @@ export async function PUT(request: NextRequest): Promise<NextResponse> {
 
   await upsertProjectSettings(projectId, {
     llmProvider: body.llmProvider as 'openai' | 'anthropic' | null | undefined,
-    llmApiKey:   typeof body.llmApiKey === 'string' ? body.llmApiKey : undefined,
+    // Distinguish null (explicit removal → clear key) from undefined (leave
+    // untouched). The SettingsUpdate contract has allowed `string | null`
+    // since M.2.d; the handler now honors null instead of dropping it.
+    llmApiKey:   body.llmApiKey === null ? null : typeof body.llmApiKey === 'string' ? body.llmApiKey : undefined,
     llmModel:    typeof body.llmModel  === 'string' ? body.llmModel  : undefined,
   })
 

@@ -37,12 +37,36 @@ describe('GET /api/v1/settings', () => {
       llmProvider: 'anthropic',
       llmModel:    null,
       llmApiKeyConfigured: true,
+      apiKeyConfiguredAt: null,
     })
     const res = await GET()
     const body = await res.json() as Record<string, unknown>
     expect(body.llmProvider).toBe('anthropic')
     expect(body.llmApiKeyConfigured).toBe(true)
     expect(body).not.toHaveProperty('llmApiKey')
+  })
+
+  // M.2.g: apiKeyConfiguredAt exposure
+  it('returns apiKeyConfiguredAt: null when no settings exist', async () => {
+    mockGetSettings.mockResolvedValue(null)
+    const res = await GET()
+    const body = await res.json() as Record<string, unknown>
+    expect(body.apiKeyConfiguredAt).toBeNull()
+    expect(body.llmApiKeyConfigured).toBe(false)
+  })
+
+  it('surfaces apiKeyConfiguredAt from the settings row', async () => {
+    const ts = '2026-06-02T10:00:00.000Z'
+    mockGetSettings.mockResolvedValue({
+      llmProvider: 'anthropic',
+      llmModel:    null,
+      llmApiKeyConfigured: true,
+      apiKeyConfiguredAt: ts,
+    })
+    const res = await GET()
+    const body = await res.json() as Record<string, unknown>
+    expect(body.apiKeyConfiguredAt).toBe(ts)
+    expect(body.llmApiKeyConfigured).toBe(true)
   })
 })
 
@@ -65,6 +89,7 @@ describe('PUT /api/v1/settings', () => {
       llmProvider: 'openai',
       llmModel:    null,
       llmApiKeyConfigured: true,
+      apiKeyConfiguredAt: null,
     })
     const res = await PUT(putReq({ llmProvider: 'openai', llmApiKey: 'sk-test' }))
     expect(res.status).toBe(200)
@@ -72,5 +97,19 @@ describe('PUT /api/v1/settings', () => {
     const body = await res.json() as Record<string, unknown>
     expect(body.llmApiKeyConfigured).toBe(true)
     expect(body).not.toHaveProperty('llmApiKey')
+  })
+
+  // M.2.g: explicit null removal must be forwarded to the upsert (it was
+  // previously coerced to undefined and silently dropped).
+  it('forwards llmApiKey: null to upsert (key removal)', async () => {
+    mockGetSettings.mockResolvedValue({
+      llmProvider: 'anthropic',
+      llmModel:    null,
+      llmApiKeyConfigured: false,
+      apiKeyConfiguredAt: null,
+    })
+    const res = await PUT(putReq({ llmApiKey: null }))
+    expect(res.status).toBe(200)
+    expect(mockUpsertSettings).toHaveBeenCalledWith(PROJECT_ID, expect.objectContaining({ llmApiKey: null }))
   })
 })

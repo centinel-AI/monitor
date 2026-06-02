@@ -215,6 +215,7 @@ export interface ProjectSettings {
   llmProvider:        'openai' | 'anthropic' | null
   llmApiKeyConfigured: boolean
   llmModel:           string | null
+  apiKeyConfiguredAt: string | null
 }
 
 export interface ProjectSettingsPatch {
@@ -228,19 +229,25 @@ export interface ProjectSettingsPatch {
  */
 export async function getProjectSettings(projectId: string): Promise<ProjectSettings | null> {
   const rows = await query<{
-    llm_provider:          'openai' | 'anthropic' | null
-    llm_api_key_encrypted: Buffer | null
-    llm_model:             string | null
+    llm_provider:           'openai' | 'anthropic' | null
+    llm_api_key_encrypted:  Buffer | null
+    llm_model:              string | null
+    llm_api_key_updated_at: Date | string | null
   }>(
-    'SELECT llm_provider, llm_api_key_encrypted, llm_model FROM project_settings WHERE project_id = $1',
+    'SELECT llm_provider, llm_api_key_encrypted, llm_model, llm_api_key_updated_at FROM project_settings WHERE project_id = $1',
     [projectId],
   )
   if (rows.length === 0) return null
   const r = rows[0]
+  const hasKey = r.llm_api_key_encrypted !== null
   return {
     llmProvider:         r.llm_provider,
-    llmApiKeyConfigured: r.llm_api_key_encrypted !== null,
+    llmApiKeyConfigured: hasKey,
     llmModel:            r.llm_model,
+    // Only surface a timestamp when a key is actually configured.
+    apiKeyConfiguredAt:  hasKey && r.llm_api_key_updated_at !== null
+      ? new Date(r.llm_api_key_updated_at).toISOString()
+      : null,
   }
 }
 
@@ -266,6 +273,9 @@ export async function upsertProjectSettings(
   if (patch.llmApiKey !== undefined) {
     const encrypted = patch.llmApiKey !== null ? encryptSecret(patch.llmApiKey) : null
     sets.push(`llm_api_key_encrypted = $${vals.push(encrypted)}`)
+    // Track when the key was last set/removed (M.2.g). now() on save,
+    // NULL on removal. Only touched when llmApiKey is part of the patch.
+    sets.push(patch.llmApiKey !== null ? 'llm_api_key_updated_at = now()' : 'llm_api_key_updated_at = NULL')
   }
   if (patch.llmModel !== undefined) {
     sets.push(`llm_model = $${vals.push(patch.llmModel)}`)
