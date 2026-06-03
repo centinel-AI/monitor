@@ -34,8 +34,14 @@ export async function POST(
   const { id } = await params
   const project_id = await getProjectId()
 
-  const incidentRows = await query<{ id: string; project_id: string; status: string; postmortem: string | null }>(
-    'SELECT id, project_id, status, postmortem FROM incidents WHERE id = $1 AND project_id = $2',
+  const incidentRows = await query<{
+    id: string
+    project_id: string
+    status: string
+    postmortem: string | null
+    postmortem_generated_at: Date | string | null
+  }>(
+    'SELECT id, project_id, status, postmortem, postmortem_generated_at FROM incidents WHERE id = $1 AND project_id = $2',
     [id, project_id],
   )
   const incident = incidentRows[0] ?? null
@@ -50,18 +56,24 @@ export async function POST(
     )
   }
 
-  // Return cached postmortem if already generated
+  // Already generated: return it with jobId null so the client knows not to poll.
   if (incident.postmortem) {
-    return NextResponse.json({ postmortem: incident.postmortem, cached: true })
+    const generatedAt = incident.postmortem_generated_at
+      ? new Date(incident.postmortem_generated_at).toISOString()
+      : ''
+    return NextResponse.json({
+      jobId: null,
+      postmortem: { markdown: incident.postmortem, generatedAt },
+    })
   }
 
   try {
     const boss = await getBoss()
-    await boss.send(QUEUE.POSTMORTEM, {
+    const jobId = await boss.send(QUEUE.POSTMORTEM, {
       projectId:  project_id,
       incidentId: id,
     } satisfies PostmortemJobPayload)
-    return NextResponse.json({ queued: true }, { status: 202 })
+    return NextResponse.json({ jobId }, { status: 202 })
   } catch (err) {
     console.error('[postmortem route] error:', err)
     return NextResponse.json({ error: 'Failed to queue postmortem generation' }, { status: 500 })

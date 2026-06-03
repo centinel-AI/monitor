@@ -206,7 +206,7 @@ Generate a complete blameless postmortem in Spanish.
 
     // 9. Persist postmortem
     await query(
-      'UPDATE incidents SET postmortem = $1 WHERE id = $2',
+      'UPDATE incidents SET postmortem = $1, postmortem_generated_at = now() WHERE id = $2',
       [markdownText, incidentId],
     )
 
