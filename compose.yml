@@ -1,0 +1,56 @@
+# monitor — internal AI monitoring service (Next.js API-only) + PostgreSQL.
+# The web console and engine live in sibling Grauss repositories.
+
+services:
+  # PostgreSQL 18+ with pgvector (incidents.embedding is vector(1536)).
+  # Mount the *parent* directory, not .../data — see https://github.com/docker-library/postgres/pull/1259
+  # If you upgraded from an older image and the container loops with a data-layout error, run: task monitor:db:wipe
+  monitor-postgres:
+    image: pgvector/pgvector:pg18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${MONITOR_POSTGRES_USER:-monitor}
+      POSTGRES_PASSWORD: ${MONITOR_POSTGRES_PASSWORD:-monitor}
+      POSTGRES_DB: ${MONITOR_POSTGRES_DB:-monitor}
+    volumes:
+      - monitor-postgres-data:/var/lib/postgresql
+    ports:
+      - "${MONITOR_POSTGRES_PORT:-5433}:5432"
+    networks:
+      - monitor-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  monitor:
+    image: grauss-monitor
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${MONITOR_PORT:-3001}:3001"
+    networks:
+      - monitor-network
+    environment:
+      MONITOR_POSTGRES_URL: postgresql://${MONITOR_POSTGRES_USER:-monitor}:${MONITOR_POSTGRES_PASSWORD:-monitor}@monitor-postgres:5432/${MONITOR_POSTGRES_DB:-monitor}
+      MONITOR_POSTGRES_POOL_MAX: ${MONITOR_POSTGRES_POOL_MAX:-10}
+      MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:-}
+      MONITOR_SERVICE_TOKEN: ${MONITOR_SERVICE_TOKEN:-}
+      MONITOR_WORKER_DISABLED: ${MONITOR_WORKER_DISABLED:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-}
+    depends_on:
+      monitor-postgres:
+        condition: service_healthy
+
+networks:
+  monitor-network:
+    driver: bridge
+
+volumes:
+  monitor-postgres-data:
+    name: grauss-monitor-postgres-data

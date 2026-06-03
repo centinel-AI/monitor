@@ -1,0 +1,99 @@
+version: "3"
+
+# monitor — internal AI monitoring service (Next.js API-only), PostgreSQL, and Docker image.
+
+tasks:
+
+  env:init:
+    desc: Create .env by copying .env.example only when .env does not exist yet
+    cmds:
+      - |
+        test -f .env.example || { echo ".env.example not found" >&2; exit 1; }
+        if test -f .env; then
+          echo ".env already exists — not overwriting."
+        else
+          cp .env.example .env
+          echo "Created .env from .env.example"
+        fi
+
+  "monitor:install":
+    desc: Install Next.js dependencies (pnpm install at repository root)
+    cmds:
+      - pnpm install
+
+  "monitor:dev":
+    desc: Next.js dev server (pnpm run dev)
+    cmds:
+      - pnpm run dev
+
+  "monitor:build":
+    desc: Next.js production build (pnpm run build)
+    cmds:
+      - pnpm run build
+
+  "monitor:serve":
+    desc: Next.js production server (pnpm run start — run monitor:build first)
+    cmds:
+      - pnpm run start
+
+  "monitor:typecheck":
+    desc: TypeScript type check, no emit (pnpm run typecheck)
+    cmds:
+      - pnpm run typecheck
+
+  "monitor:test":
+    desc: Run the Vitest unit suite once (pnpm run test)
+    cmds:
+      - pnpm run test
+
+  "monitor:db:migrate":
+    desc: Apply pending SQL migrations against MONITOR_POSTGRES_URL (pnpm run db:migrate)
+    cmds:
+      - pnpm run db:migrate
+
+  "monitor:docker:build":
+    desc: Build Docker image for the monitor service (Compose service monitor; reads MONITOR_* from .env)
+    deps: [env:init]
+    cmds:
+      - docker compose build monitor
+
+  "monitor:docker:up":
+    desc: Start the monitor container in the background (reuse image if present)
+    deps: [env:init]
+    cmds:
+      - docker compose up -d monitor
+
+  "monitor:docker:down":
+    desc: Stop the monitor container
+    cmds:
+      - docker compose stop monitor
+
+  "monitor:docker:start":
+    desc: Build the monitor image and start the container (sequential; port MONITOR_PORT)
+    deps: [env:init]
+    cmds:
+      - docker compose build monitor
+      - docker compose up -d monitor
+
+  "monitor:db:up":
+    desc: Start monitor Postgres (monitor-postgres; volume grauss-monitor-postgres-data at /var/lib/postgresql for PG 18+)
+    deps: [env:init]
+    cmds:
+      - docker compose up -d monitor-postgres
+
+  "monitor:db:stop":
+    desc: Stop the monitor Postgres container (data remains in the Docker volume)
+    cmds:
+      - docker compose stop monitor-postgres
+
+  "monitor:db:rm":
+    desc: Stop and remove the monitor Postgres container (volume is kept)
+    cmds:
+      - docker compose rm -sf monitor-postgres
+
+  "monitor:db:wipe":
+    desc: Stop/remove monitor-postgres and delete the data volume (irreversible local reset)
+    cmds:
+      - docker compose stop monitor-postgres || true
+      - docker compose rm -sf monitor-postgres || true
+      - docker volume rm grauss-monitor-postgres-data || true

@@ -1,5 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Self-contained server bundle for the Docker runtime stage (see Dockerfile).
+  output: 'standalone',
   async headers() {
     return [
       {
