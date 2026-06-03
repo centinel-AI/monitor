@@ -9,7 +9,6 @@ ALTER TABLE projects ALTER COLUMN name SET DEFAULT 'unnamed';
 -- Remove RLS policies that depend on Supabase Auth JWT (now gone).
 -- Isolation is enforced in application code via middleware + parametrised queries.
 DROP POLICY IF EXISTS "project_isolation" ON projects;
-DROP POLICY IF EXISTS "project_isolation" ON users;
 DROP POLICY IF EXISTS "project_isolation" ON services;
 DROP POLICY IF EXISTS "project_isolation" ON connectors;
 DROP POLICY IF EXISTS "project_isolation" ON deploys;
@@ -22,7 +21,6 @@ DROP FUNCTION IF EXISTS auth_project_id();
 DROP FUNCTION IF EXISTS auth_org_id();
 
 ALTER TABLE projects      DISABLE ROW LEVEL SECURITY;
-ALTER TABLE users         DISABLE ROW LEVEL SECURITY;
 ALTER TABLE services      DISABLE ROW LEVEL SECURITY;
 ALTER TABLE connectors    DISABLE ROW LEVEL SECURITY;
 ALTER TABLE deploys       DISABLE ROW LEVEL SECURITY;

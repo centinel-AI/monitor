@@ -10,7 +10,7 @@ ALTER INDEX organizations_pkey RENAME TO projects_pkey;
 ALTER TRIGGER trg_organizations_updated_at ON projects RENAME TO trg_projects_updated_at;
 
 -- 4. Rename org_id → project_id in all child tables
-ALTER TABLE users           RENAME COLUMN org_id TO project_id;
+-- (users table removed from 001 in M.2.k — no column to rename here)
 ALTER TABLE services        RENAME COLUMN org_id TO project_id;
 ALTER TABLE connectors      RENAME COLUMN org_id TO project_id;
 ALTER TABLE deploys         RENAME COLUMN org_id TO project_id;
@@ -20,7 +20,6 @@ ALTER TABLE incidents       RENAME COLUMN org_id TO project_id;
 ALTER TABLE snoozed_groups  RENAME COLUMN org_id TO project_id;
 
 -- 5. Rename FK constraints
-ALTER TABLE users           RENAME CONSTRAINT users_org_id_fkey           TO users_project_id_fkey;
 ALTER TABLE services        RENAME CONSTRAINT services_org_id_fkey        TO services_project_id_fkey;
 ALTER TABLE connectors      RENAME CONSTRAINT connectors_org_id_fkey      TO connectors_project_id_fkey;
 ALTER TABLE deploys         RENAME CONSTRAINT deploys_org_id_fkey         TO deploys_project_id_fkey;
@@ -38,35 +37,9 @@ ALTER INDEX idx_deploys_org_time        RENAME TO idx_deploys_project_time;
 ALTER INDEX idx_services_org            RENAME TO idx_services_project;
 ALTER INDEX idx_connectors_org_type     RENAME TO idx_connectors_project_type;
 
--- 7. Update auth_org_id() to use the renamed column (keeps legacy callers working)
-CREATE OR REPLACE FUNCTION auth_org_id()
-RETURNS UUID AS $$
-  SELECT project_id FROM users WHERE id = auth.uid()
-$$ LANGUAGE sql SECURITY DEFINER STABLE;
-
--- 8. New canonical function
-CREATE OR REPLACE FUNCTION auth_project_id()
-RETURNS UUID AS $$
-  SELECT project_id FROM users WHERE id = auth.uid()
-$$ LANGUAGE sql SECURITY DEFINER STABLE;
-
--- 9. Recreate RLS policies with new names and column references
-DROP POLICY "org_isolation" ON projects;
-DROP POLICY "org_isolation" ON users;
-DROP POLICY "org_isolation" ON services;
-DROP POLICY "org_isolation" ON connectors;
-DROP POLICY "org_isolation" ON deploys;
-DROP POLICY "org_isolation" ON alert_events;
-DROP POLICY "org_isolation" ON alert_groups;
-DROP POLICY "org_isolation" ON incidents;
-DROP POLICY "org_isolation" ON snoozed_groups;
-
-CREATE POLICY "project_isolation" ON projects       USING (id = auth_project_id());
-CREATE POLICY "project_isolation" ON users          USING (project_id = auth_project_id());
-CREATE POLICY "project_isolation" ON services       USING (project_id = auth_project_id());
-CREATE POLICY "project_isolation" ON connectors     USING (project_id = auth_project_id());
-CREATE POLICY "project_isolation" ON deploys        USING (project_id = auth_project_id());
-CREATE POLICY "project_isolation" ON alert_events   USING (project_id = auth_project_id());
-CREATE POLICY "project_isolation" ON alert_groups   USING (project_id = auth_project_id());
-CREATE POLICY "project_isolation" ON incidents      USING (project_id = auth_project_id());
-CREATE POLICY "project_isolation" ON snoozed_groups USING (project_id = auth_project_id());
+-- M.2.k: steps 7-9 (recreating auth_org_id()/auth_project_id() and the RLS
+-- "project_isolation" policies) were removed. They depended on auth.uid()
+-- (Supabase) and on the users table, neither of which exists after M.2.k
+-- cleaned 001. They were transient anyway — M.2.e drops both the functions
+-- and the policies (with IF EXISTS). Only the renames above remain, which is
+-- this migration's actual purpose. Tenant isolation is enforced in app code.

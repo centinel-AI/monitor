@@ -1,0 +1,5 @@
+# pnpm 11 build-script approval. tsx/vitest/next work with the prebuilt
+# esbuild binary, so its (no-op) install build is skipped. Added by M.2.k
+# as a side effect of `pnpm add -D tsx`.
+allowBuilds:
+  esbuild: false

@@ -14,16 +14,6 @@ CREATE TABLE organizations (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Users
-CREATE TABLE users (
-  id          UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  org_id      UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  email       TEXT NOT NULL,
-  full_name   TEXT,
-  role        TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 -- Services (cada servicio monitoreado)
 CREATE TABLE services (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -104,8 +94,7 @@ CREATE TABLE incidents (
   postmortem   TEXT,
   embedding    vector(1536),
   started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  resolved_at  TIMESTAMPTZ,
-  created_by   UUID REFERENCES users(id) ON DELETE SET NULL
+  resolved_at  TIMESTAMPTZ
 );
 
 -- Snoozed groups (alertas silenciadas temporalmente)
@@ -114,7 +103,6 @@ CREATE TABLE snoozed_groups (
   org_id     UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   group_id   UUID NOT NULL REFERENCES alert_groups(id) ON DELETE CASCADE,
   expires_at TIMESTAMPTZ NOT NULL,
-  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -140,33 +128,8 @@ CREATE TRIGGER trg_organizations_updated_at
   BEFORE UPDATE ON organizations
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
--- ─── ROW LEVEL SECURITY ──────────────────────────────────────────────────────
-
-ALTER TABLE organizations  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE users          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE services       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE connectors     ENABLE ROW LEVEL SECURITY;
-ALTER TABLE deploys        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE alert_events   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE alert_groups   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE incidents      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE snoozed_groups ENABLE ROW LEVEL SECURITY;
-
--- Función helper para obtener el org_id del usuario autenticado
-CREATE OR REPLACE FUNCTION auth_org_id()
-RETURNS UUID AS $$
-  SELECT org_id FROM users WHERE id = auth.uid()
-$$ LANGUAGE sql SECURITY DEFINER STABLE;
-
--- Políticas: cada usuario solo ve los datos de su organización
-CREATE POLICY "org_isolation" ON organizations  USING (id = auth_org_id());
-CREATE POLICY "org_isolation" ON users          USING (org_id = auth_org_id());
-CREATE POLICY "org_isolation" ON services       USING (org_id = auth_org_id());
-CREATE POLICY "org_isolation" ON connectors     USING (org_id = auth_org_id());
-CREATE POLICY "org_isolation" ON deploys        USING (org_id = auth_org_id());
-CREATE POLICY "org_isolation" ON alert_events   USING (org_id = auth_org_id());
-CREATE POLICY "org_isolation" ON alert_groups   USING (org_id = auth_org_id());
-CREATE POLICY "org_isolation" ON incidents      USING (org_id = auth_org_id());
-CREATE POLICY "org_isolation" ON snoozed_groups USING (org_id = auth_org_id());
-
--- El webhook endpoint usa service_role (bypass RLS) — no necesita política adicional
+-- NOTE: RLS, the auth_org_id() helper and the users table (all inherited from
+-- the CentinelAI/Supabase monolith) were removed from this migration in M.2.k
+-- so the schema applies against a plain Postgres. They were transient anyway —
+-- the rename migration recreated them and M.2.e/M.2.f dropped them. Tenant
+-- isolation is enforced in application code (service-token middleware).
