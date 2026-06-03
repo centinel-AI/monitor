@@ -1,0 +1,63 @@
+name: Feature request
+description: Suggest an improvement, new source, or better behavior for monitor.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share **what** you want to achieve and **why** it matters. Concrete examples (payloads, endpoints, expected output) help maintainers evaluate the idea.
+
+        For **large or opinionated** changes, a short design note here avoids rework later.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem or motivation
+      description: What is hard, missing, or inconsistent today?
+      placeholder: Alerts from <source> are not supported, so we lose visibility into ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should monitor do? Be as specific as you can (new source, endpoint, scoring rule, notification channel).
+      placeholder: |
+        - Add a normalizer for …
+        - Expected behavior: POST /api/webhooks/… then …
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where does this change live?
+      options:
+        - Ingestion / normalizers (new or extended source)
+        - Pipeline agents (dedup / score / correlate / notify)
+        - HTTP API (v1 / incidents)
+        - Postmortem / LLM providers
+        - Notifications (Slack / email)
+        - Infrastructure (Docker / Compose / Taskfile / CI)
+        - Documentation
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways you thought about solving this (including "do nothing").
+      render: markdown
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links to upstream docs, diagrams, prior discussions, or examples from other tools.
+      render: markdown

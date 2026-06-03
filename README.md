@@ -1,5 +1,11 @@
 # Monitor
 
+[![CI](https://github.com/grauss/monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/grauss/monitor/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![GitHub stars](https://img.shields.io/github/stars/grauss/monitor?style=social)](https://github.com/grauss/monitor)
+
 **Monitor** is the AI monitoring service of the Grauss platform. It ingests alerts
 from your observability stack, groups related events into incidents, scores them by
 severity, sends one consolidated notification, and generates AI postmortems on demand.

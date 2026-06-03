@@ -1,0 +1,122 @@
+name: Bug report
+description: Report defects — crashes, wrong behavior, regressions, or unclear errors in monitor.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Short, **reproducible** reports get fixed faster.
+
+        **Do not paste secrets** (service tokens, API keys, `MASTER_ENCRYPTION_KEY`, raw `.env`). Redact or describe paths only.
+
+        If this is a **security vulnerability**, do **not** use this form — use private reporting (see `SECURITY.md`).
+
+  - type: dropdown
+    id: bug_type
+    attributes:
+      label: Bug type
+      description: What best describes the problem?
+      options:
+        - Wrong behavior (incorrect result or state)
+        - Crash / hang (server exits, freezes, or returns 5xx)
+        - Regression (used to work, now fails)
+        - Ingestion / normalizer (alert parsed incorrectly or rejected)
+        - Postmortem / LLM (generation fails or output is wrong)
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source / area
+      description: Which alert source or area is involved?
+      options:
+        - Kubernetes
+        - Prometheus
+        - Grafana
+        - GitLab
+        - HTTP API (v1 / incidents)
+        - Pipeline (dedup / score / correlate / notify)
+        - Not applicable / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences — what is broken?
+      placeholder: After POSTing a Prometheus alert, the event is stored but never grouped ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps someone else can follow (`task` / `curl` commands, payload shape, etc.).
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened — including exact error messages and HTTP status codes.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Release tag or `git rev-parse HEAD`.
+      placeholder: v0.1.0 or 1a2b3c4
+    validations:
+      required: true
+
+  - type: input
+    id: node_version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version` (or "Docker image" if running the container).
+      placeholder: v20.18.0 / Docker
+
+  - type: input
+    id: host_os
+    attributes:
+      label: Host OS
+      description: Where you ran monitor (laptop, CI, container platform, etc.).
+      placeholder: macOS 15 / Ubuntu 24.04 / Azure Container Apps / ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and full error output
+      description: Paste server logs / stack traces. Redact tokens, keys, and account identifiers.
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Redacted payload snippet, related issues, or screenshots.
+      render: markdown
