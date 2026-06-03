@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { pool } from './client'
 
-const MIGRATIONS_DIR = join(process.cwd(), 'supabase', 'migrations')
+const MIGRATIONS_DIR = join(process.cwd(), 'db', 'migrations')
 
 export async function runMigrations(): Promise<void> {
   await pool.query(`

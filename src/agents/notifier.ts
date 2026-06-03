@@ -244,7 +244,7 @@ export async function runNotifier(
   // 4. No Slack configured → mark as failed (not retried) and exit.
   if (!ctx.slackChannel || !ctx.slackBotToken) {
     // TODO M.3: email fallback. Eliminado en M.2.e porque la tabla
-    // `users` con emails de owner desaparece al retirar Supabase Auth.
+    // `users` con emails de owner desaparece al retirar el auth heredado.
     // Cuando el portal Grauss exponga contactos por proyecto:
     //   - obtener email del owner vía endpoint del portal
     //   - si Slack no configurado y email existe, enviar email
@@ -357,7 +357,7 @@ export async function runNotify(payload: NotifyJobPayload): Promise<void> {
           ).then(r => r[0] ?? null),
           getSlackConfigForProject(pId),
           // TODO M.3: email fallback. Eliminado en M.2.e porque la tabla
-          // `users` con emails de owner desaparece al retirar Supabase Auth.
+          // `users` con emails de owner desaparece al retirar el auth heredado.
           // Cuando el portal Grauss exponga contactos por proyecto, añadir aquí
           // la consulta al endpoint del portal para obtener email de contacto.
         ])

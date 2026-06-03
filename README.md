@@ -9,7 +9,7 @@ Servicio interno de monitorización IA del portal Grauss. Fork conceptual de `/a
 - Next.js 14 (App Router, solo API routes)
 - TypeScript 5, React 18
 - Inngest 4 (pipeline durable de procesamiento)
-- Supabase Postgres (BD)
+- PostgreSQL (BD, vía `pg`)
 - Anthropic Claude (scoring, correlación, postmortems)
 - Slack Web API (notificaciones salientes + acciones entrantes)
 - Resend (email transaccional)
@@ -22,13 +22,13 @@ src/agents/         Pipeline: deduplicator → scorer → correlator → notifie
                     + postmortem bajo demanda. Funciones puras testeadas.
 src/lib/claude/     Cliente Anthropic, prompts, embeddings.
 src/lib/inngest/    Cliente Inngest, definición de functions.
-src/lib/supabase/   Cliente server-only + queries.
+src/lib/db/         Cliente PostgreSQL (pg) + queries + runner de migraciones.
 src/lib/slack/      Cliente Slack (out + in).
 src/lib/resend/     Wrapper de email.
 src/types/          Tipos de eventos y modelo de BD.
 src/app/api/        Endpoints HTTP (webhooks, incidents, connectors, health,
                     inngest, slack actions, k8s install manifest).
-supabase/migrations/  Schema inicial heredado de /app (se adapta en M.2).
+db/migrations/      Schema inicial heredado de /app (se adapta en M.2).
 ```
 
 ## Arrancar en local
@@ -46,7 +46,7 @@ El servidor expone los endpoints en `http://localhost:3000`. Inngest necesita su
 
 Ver `.env.example` para la lista completa. Imprescindibles:
 
-- `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` — acceso a BD.
+- `MONITOR_POSTGRES_URL` — cadena de conexión a PostgreSQL.
 - `ANTHROPIC_API_KEY` — en M.1 se lee de env global; en M.2 pasará a leerse por proyecto desde BD (BYOK).
 - `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY` — cliente Inngest.
 - `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` — solo si se usa la integración.
@@ -54,7 +54,7 @@ Ver `.env.example` para la lista completa. Imprescindibles:
 
 ## Estado actual y roadmap
 
-**Fase M.1 — completada.** Esqueleto inicial del servicio. Backend operativo: ingesta de webhooks, pipeline, postmortem, salida a Slack/email. La autenticación de los endpoints HTTP sigue siendo la heredada de CentinelAI (sesión humana Supabase) — funciona, pero no es la que el portal Grauss usará.
+**Fase M.1 — completada.** Esqueleto inicial del servicio. Backend operativo: ingesta de webhooks, pipeline, postmortem, salida a Slack/email. La autenticación de los endpoints HTTP sigue siendo la heredada de CentinelAI (sesión humana legacy) — funciona, pero no es la que el portal Grauss usará.
 
 **Fase M.2 — próxima.** Adaptación al contrato del portal:
 - Middleware nuevo `X-Service-Token` + `X-Grauss-Project-Id` para llamadas servicio-a-servicio desde el portal.
@@ -63,7 +63,7 @@ Ver `.env.example` para la lista completa. Imprescindibles:
 - API key de Anthropic por proyecto, cifrada en BD (AES-256-GCM).
 - Adaptación del RLS para identidad delegada.
 - Endpoints nuevos `/v1/projects` (CRUD del mapeo) y `/v1/settings` (gestión de API key).
-- Migración de la BD de Supabase a Azure Database for PostgreSQL
+- Migración de la BD heredada a Azure Database for PostgreSQL
   (Flexible Server). Ambos servicios (portal Grauss y monitor)
   mantendrán bases separadas para preservar aislamiento de fallos,
   pero compartirán proveedor cloud (Azure) por coherencia operativa.
@@ -87,14 +87,11 @@ Una excepción documentada: `scorer.ts` se modificó respecto al original para e
 
 ## Aplicar migraciones
 
-Las migraciones viven en `supabase/migrations/` como SQL puro. Para aplicarlas contra tu instancia de Supabase o PostgreSQL directo:
+Las migraciones viven en `db/migrations/` como SQL puro, aplicadas en orden alfabético (prefijo timestamp) y registradas en la tabla `schema_migrations`:
 
 ```bash
-# Contra Supabase CLI (si está configurado)
-supabase db push
-
-# O directamente con psql
-psql "$DATABASE_URL" -f supabase/migrations/20260527000000_rename_organizations_to_projects.sql
+# Aplica las migraciones pendientes contra MONITOR_POSTGRES_URL
+pnpm db:migrate
 ```
 
 La migración `20260527000000` renombra la tabla `organizations` → `projects` y la columna `org_id` → `project_id` en todas las tablas hijas. Aplícala antes de desplegar el código de la Fase M.2.a.
