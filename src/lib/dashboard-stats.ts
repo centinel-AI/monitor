@@ -159,6 +159,105 @@ export async function getTopAlerts(projectId: string): Promise<TopAlert[]> {
   return groups.map((g) => ({ id: g.id, score: g.score ?? 0, reason: g.score_reason ?? eventReasonMap[g.id] ?? 'Unknown', serviceName: g.service_ids?.[0] ? (serviceMap[g.service_ids[0]] ?? null) : null, createdAt: g.created_at }))
 }
 
+// ─── Alert groups (M3: list endpoint) ─────────────────────────────────────────
+
+export interface AlertGroupSummary {
+  id: string
+  score: number | null
+  scoreReason: string | null
+  correlated: boolean
+  notified: boolean
+  snoozedUntil: string | null
+  feedback: string | null
+  serviceIds: string[]
+  serviceNames: string[]
+  eventCount: number
+  windowStart: string | null
+  windowEnd: string | null
+  createdAt: string
+}
+
+function toIso(v: Date | string | null | undefined): string | null {
+  return v === null || v === undefined ? null : new Date(v).toISOString()
+}
+
+/**
+ * List a project's alert groups, newest first, with resolved service names.
+ * Reuses getTopAlerts' service-name resolution; adds optional notified/correlated
+ * filters and limit/offset paging. Scoped by project_id.
+ */
+export async function listAlertGroups(
+  projectId: string,
+  opts: { limit: number; offset: number; notified?: boolean; correlated?: boolean },
+): Promise<{ groups: AlertGroupSummary[]; total: number }> {
+  const filterVals: unknown[] = [projectId]
+  const filters = ['project_id = $1']
+  if (opts.notified !== undefined) filters.push(`notified = $${filterVals.push(opts.notified)}`)
+  if (opts.correlated !== undefined) filters.push(`correlated = $${filterVals.push(opts.correlated)}`)
+  const where = filters.join(' AND ')
+
+  const countRows = await query<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM alert_groups WHERE ${where}`,
+    filterVals,
+  )
+  const total = parseInt(countRows[0]?.count ?? '0', 10)
+
+  const rows = await query<{
+    id: string
+    score: number | null
+    score_reason: string | null
+    correlated: boolean
+    notified: boolean
+    snoozed_until: Date | string | null
+    feedback: string | null
+    service_ids: string[] | null
+    event_ids: string[] | null
+    window_start: Date | string | null
+    window_end: Date | string | null
+    created_at: Date | string
+  }>(
+    `SELECT id, score, score_reason, correlated, notified, snoozed_until, feedback,
+            service_ids, event_ids, window_start, window_end, created_at
+       FROM alert_groups WHERE ${where}
+      ORDER BY created_at DESC
+      LIMIT $${filterVals.length + 1} OFFSET $${filterVals.length + 2}`,
+    [...filterVals, opts.limit, opts.offset],
+  )
+
+  // Resolve service names (same approach as getTopAlerts).
+  const serviceIds = Array.from(new Set(rows.flatMap((r) => r.service_ids ?? [])))
+  let serviceMap: Record<string, string> = {}
+  if (serviceIds.length > 0) {
+    const placeholders = serviceIds.map((_, i) => `$${i + 1}`).join(', ')
+    const svcs = await query<{ id: string; name: string }>(
+      `SELECT id, name FROM services WHERE id IN (${placeholders})`,
+      serviceIds,
+    )
+    serviceMap = Object.fromEntries(svcs.map((s) => [s.id, s.name]))
+  }
+
+  const groups: AlertGroupSummary[] = rows.map((r) => {
+    const ids = r.service_ids ?? []
+    return {
+      id: r.id,
+      score: r.score,
+      scoreReason: r.score_reason,
+      correlated: r.correlated,
+      notified: r.notified,
+      snoozedUntil: toIso(r.snoozed_until),
+      feedback: r.feedback,
+      serviceIds: ids,
+      serviceNames: ids.map((id) => serviceMap[id]).filter((n): n is string => Boolean(n)),
+      eventCount: (r.event_ids ?? []).length,
+      windowStart: toIso(r.window_start),
+      windowEnd: toIso(r.window_end),
+      createdAt: new Date(r.created_at).toISOString(),
+    }
+  })
+
+  return { groups, total }
+}
+
 // ─── Services ─────────────────────────────────────────────────────────────────
 
 export async function getServicesWithStatus(projectId: string): Promise<ServiceWithStatus[]> {
