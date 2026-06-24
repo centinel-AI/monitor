@@ -1,5 +1,5 @@
 import { WebClient } from '@slack/web-api'
-import { query } from '@/lib/db/client'
+import { getProjectSlackConfig } from '@/lib/db/queries'
 
 export const slack = new WebClient(process.env.SLACK_BOT_TOKEN)
 
@@ -8,21 +8,23 @@ export interface SlackConfig {
   botToken: string
 }
 
+/**
+ * Resolve the Slack config for a project from the SINGLE source of truth
+ * (project_settings, via getProjectSlackConfig — token decrypted server-side).
+ *
+ * Falls back to the global SLACK_BOT_TOKEN / SLACK_CHANNEL envs so existing
+ * single-workspace deployments keep working. Returns null if neither yields a
+ * usable channel + token. The token is never logged.
+ *
+ * FIX: this previously read projects.slack_channel / projects.slack_bot_token —
+ * columns that never existed in any migration. Both this reader and the connector
+ * writer now converge on project_settings.
+ */
 export async function getSlackConfigForProject(projectId: string): Promise<SlackConfig | null> {
-  const rows = await query<{ slack_channel: string | null; slack_bot_token: string | null }>(
-    'SELECT slack_channel, slack_bot_token FROM projects WHERE id = $1',
-    [projectId],
-  )
-  const row = rows[0] ?? null
+  const cfg = await getProjectSlackConfig(projectId)
 
-  if (!row) return null
-
-  const channel   = typeof row.slack_channel   === 'string' ? row.slack_channel   : null
-  const botToken  = typeof row.slack_bot_token === 'string' ? row.slack_bot_token : null
-
-  // Fall back to env vars so existing deployments keep working
-  const resolvedToken   = botToken  || process.env.SLACK_BOT_TOKEN  || null
-  const resolvedChannel = channel   || process.env.SLACK_CHANNEL    || null
+  const resolvedToken   = cfg.botToken || process.env.SLACK_BOT_TOKEN || null
+  const resolvedChannel = cfg.channel  || process.env.SLACK_CHANNEL   || null
 
   if (!resolvedToken || !resolvedChannel) return null
   return { channel: resolvedChannel, botToken: resolvedToken }

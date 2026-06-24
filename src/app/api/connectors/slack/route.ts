@@ -1,30 +1,53 @@
 import { NextResponse } from 'next/server'
 import { getProjectId } from '@/lib/auth/context'
-import { query } from '@/lib/db/client'
+import { getProjectSlackStatus, setProjectSlackConfig } from '@/lib/db/queries'
 
-export async function POST(request: Request) {
+// T+P route (service token + X-Grauss-Project-Id, validated by middleware).
+// The bot token is stored ENCRYPTED in project_settings (AES-256-GCM, same as the
+// LLM key) and is never returned to the client, logged, or echoed in errors.
+
+/**
+ * GET /api/connectors/slack — connector status for the project.
+ * → 200 { slackConfigured: boolean, channel: string | null }  (never the token)
+ */
+export async function GET(): Promise<NextResponse> {
+  const projectId = await getProjectId()
+  return NextResponse.json(await getProjectSlackStatus(projectId))
+}
+
+/**
+ * POST /api/connectors/slack — save { channel, botToken } for the project.
+ * Validates minimally (botToken starts with xoxb-, channel non-empty), encrypts
+ * the token, stores both in project_settings. → 200 { success, slackConfigured, channel }.
+ */
+export async function POST(request: Request): Promise<NextResponse> {
+  const projectId = await getProjectId()
+
+  let body: { channel?: unknown; botToken?: unknown }
   try {
-    const project_id = await getProjectId()
-
-    const body = await request.json() as { channel?: unknown; botToken?: unknown }
-    const { channel, botToken } = body
-
-    if (!channel) {
-      return NextResponse.json({ error: 'Channel required' }, { status: 400 })
-    }
-
-    await query(
-      typeof botToken === 'string' && botToken.startsWith('xoxb-')
-        ? 'UPDATE projects SET slack_channel = $1, slack_bot_token = $2 WHERE id = $3'
-        : 'UPDATE projects SET slack_channel = $1 WHERE id = $2',
-      typeof botToken === 'string' && botToken.startsWith('xoxb-')
-        ? [channel as string, botToken, project_id]
-        : [channel as string, project_id],
-    )
-
-    return NextResponse.json({ success: true })
-  } catch (error) {
-    console.error('Slack connector error:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    body = (await request.json()) as { channel?: unknown; botToken?: unknown }
+  } catch {
+    return NextResponse.json({ error: 'invalid JSON body' }, { status: 400 })
   }
+
+  const channel = typeof body.channel === 'string' ? body.channel.trim() : ''
+  const botToken = typeof body.botToken === 'string' ? body.botToken.trim() : ''
+
+  if (!channel) {
+    return NextResponse.json({ error: 'channel is required' }, { status: 400 })
+  }
+  if (!botToken.startsWith('xoxb-')) {
+    return NextResponse.json({ error: 'botToken must be a Slack bot token (xoxb-...)' }, { status: 400 })
+  }
+
+  try {
+    await setProjectSlackConfig(projectId, { channel, botToken })
+  } catch (e) {
+    // Never include the token in logs or the response.
+    console.error('[connectors/slack] failed to save config:', e instanceof Error ? e.message : 'unknown')
+    return NextResponse.json({ error: 'failed to save Slack configuration' }, { status: 500 })
+  }
+
+  const status = await getProjectSlackStatus(projectId)
+  return NextResponse.json({ success: true, ...status })
 }

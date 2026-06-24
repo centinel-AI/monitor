@@ -30,8 +30,7 @@ Centralizada en **`src/middleware.ts`** (matcher `'/api/:path*'`, línea 65). NO
 **Dos cabeceras** para las rutas por-proyecto:
 
 1. **`X-Service-Token`** (se lee en minúsculas `x-service-token`, `middleware.ts:44`)
-   - Se compara con **`process.env.MONITOR_SERVICE_TOKEN`** mediante **`token !== expected`** (`middleware.ts:45`).
-   - ⚠️ Comparación **NO timing-safe**, token **global** (no por-proyecto), en claro en env. Si falta el env → `500 {error:'service token not configured'}`; si no coincide/ausente → `401 {error:'unauthorized'}`.
+   - Se compara con **`process.env.MONITOR_SERVICE_TOKEN`** mediante un **compare en tiempo constante** (`safeEqual`, patrón `tsscmp` puro-JS; el Edge runtime del middleware no admite `node:crypto`). ✅ RESUELTO (hardening). Token **global** (no por-proyecto), en claro en env. Si falta el env → `500 {error:'service token not configured'}`; si no coincide/ausente → `401 {error:'unauthorized'}`.
 2. **`X-Grauss-Project-Id`** (UUID, `middleware.ts:54`) — **así se deriva el tenant/proyecto**, NO por lookup del token.
    - Se valida como UUID (`UUID_RE`); si falta/ inválido → `400 {error:'missing or invalid x-grauss-project-id'}`.
    - El middleware lo reinyecta como `x-monitor-project-id` (`middleware.ts:60`); los handlers lo leen con **`getProjectId()`** (`src/lib/auth/context.ts:8`, lanza si falta) o `getOptionalProjectId()`.
@@ -70,9 +69,11 @@ Auth col.: **T** = X-Service-Token, **P** = X-Grauss-Project-Id, **self** = self
 | `POST /api/incidents/[id]/postmortem` | T+P | Encola generación (requiere `resolved`) | — | `202 {jobId}` · si ya existe `{jobId:null, postmortem{…}}` · `400 'must be resolved'` |
 | `POST /api/services/[id]/snooze` | T+P | Silencia 1h los `alert_groups` abiertos del service | — | `200 {success:true, snoozedUntil}` · `404` |
 | `GET /api/connectors/verify?type=` | T+P | ¿Conector con eventos en 24h? | query `?type=` | `200 {connected, lastEventAt, eventCount24h}` · `400` |
-| `POST /api/connectors/slack` | T+P | Guarda canal/token Slack | `{channel, botToken?}` | `200 {success:true}` — ⚠️ **ROTA** (ver §11) |
+| `GET /api/connectors/slack` | T+P | Estado del connector Slack | — | `200 {slackConfigured:bool, channel}` (nunca el token) |
+| `POST /api/connectors/slack` | T+P | Guarda canal + bot token (cifrado) en project_settings | `{channel, botToken}` (xoxb-…) | `200 {success:true, slackConfigured, channel}` · `400` si token no xoxb-/canal vacío |
+| `POST /api/connectors/slack/verify` | T+P | Prueba el token guardado (Slack auth.test) | — | `200 {ok:bool, team?}` / `{ok:false, error:'not_configured'\|'auth_failed'}` (nunca el token) |
 | `POST /api/webhooks/[source]` | **self** | Ingesta de alertas (ver §8) | payload nativo de la fuente | `200 {received:true, eventIds:[]}` |
-| `POST /api/slack/actions` | **self** | Botones interactivos Slack | Slack payload | — (⚠️ firma **sin verificar**, ver §11) |
+| `POST /api/slack/actions` | **self** | Botones interactivos Slack | Slack payload | `401` si la firma falta/inválida o el timestamp es viejo (>5min); `200` tras verificar (firma HMAC-SHA256 v0 sobre el raw body, ver §11) |
 | `GET /api/health` | public | Healthcheck | — | `200 {status:'ok', version, timestamp}` |
 | `GET /api/install/k8s/manifest.yaml` | public | Manifiesto K8s | — | YAML |
 
@@ -205,9 +206,9 @@ Confirmado en `src/lib/env.ts` y `src/middleware.ts`. Base URL del servicio para
 
 ## 11. Sorpresas / deuda / lo que no cuadra
 
-1. **`POST /api/connectors/slack` está ROTO.** Hace `UPDATE projects SET slack_channel = …, slack_bot_token = …`, pero **esas columnas no existen** en ninguna migración (grep `slack_channel|slack_bot_token` en `db/migrations` → 0). Cualquier llamada con `channel` lanza "column does not exist". Slack se configuraría realmente vía env (`SLACK_BOT_TOKEN`/`SLACK_CHANNEL`) o `connectors.config jsonb`, no por esta ruta.
-2. **`POST /api/slack/actions` sin verificar firma.** Es pública (self-auth) pero `route.ts` tiene `// TODO: Add SLACK_SIGNING_SECRET verification before production traffic` → hoy **acepta payloads sin autenticar**. Riesgo de seguridad.
-3. **Token de servicio no es timing-safe ni por-proyecto.** `X-Service-Token` se compara con `!==` contra un único `MONITOR_SERVICE_TOKEN` global. No hay BYO-token por proyecto a nivel de servicio (sí lo hay para ingesta: `projects.api_token`). "BYOK por project" aplica solo a la **clave LLM**, no al token de servicio.
+1. ~~`POST /api/connectors/slack` está ROTO~~ → **✅ RESUELTO**. Tanto el connector (escritura) como el **notificador** (lectura, vía `getSlackConfigForProject`) apuntaban a `projects.slack_channel`/`projects.slack_bot_token`, columnas **inexistentes** — ambos rotos. Convergidos a **`project_settings`** (única fuente de verdad): migración aditiva `slack_bot_token_encrypted bytea` + `slack_channel text`. El **bot token se cifra con AES-256-GCM** (mismo `secrets.ts` que la clave LLM), nunca en texto plano ni en respuestas/logs/errores. `GET` devuelve solo `{slackConfigured, channel}`. `POST` cifra y guarda; `POST …/verify` prueba con `auth.test` el token descifrado server-side. El notificador ahora lee de `project_settings` (con fallback a envs globales `SLACK_BOT_TOKEN`/`SLACK_CHANNEL` para despliegues mono-workspace).
+2. ~~`POST /api/slack/actions` sin verificar firma~~ → **✅ RESUELTO (hardening)**. Verifica la firma Slack v0 (HMAC-SHA256 sobre el raw body, `src/lib/crypto/slack-signature.ts`) timing-safe + ventana de replay de 5 min; firma/timestamp ausente o inválido, timestamp viejo, o secret no configurado → `401` genérico (sin filtrar el secret). Usa el **`SLACK_SIGNING_SECRET` global** (no por-proyecto — confirmado).
+3. **Token de servicio: comparación ahora timing-safe** ✅ (`safeEqual` en `middleware.ts`). Sigue siendo **global** (no por-proyecto) por diseño — solo se endureció la comparación, no la semántica. BYO-token por proyecto sigue siendo solo para ingesta (`projects.api_token`); "BYOK por project" aplica solo a la clave LLM.
 4. **`projects.api_token` (ingesta) en igualdad SQL plana**, no hasheado ni timing-safe (`webhooks/[source]/route.ts:39`).
 5. **RAG embedding muerto.** `incidents.embedding vector(1536)` existe pero **nunca se escribe** (`postmortem.ts:214` "pgvector migration pending"). No hay búsqueda por similitud real.
 6. **Pipeline notify→postmortem desconectado.** El postmortem es manual (vía endpoint), no encadenado tras notify. La narrativa "dedup→score→correlate→notify→postmortem" automática **se corta en notify**.

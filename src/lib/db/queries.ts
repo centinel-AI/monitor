@@ -1,7 +1,7 @@
 import { query } from './client'
 import type { AlertGroup, Service } from '@/types/database'
 import type { NormalizedAlert } from '@/types/events'
-import { encryptSecret } from '@/lib/crypto/secrets'
+import { encryptSecret, decryptSecret } from '@/lib/crypto/secrets'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -287,5 +287,62 @@ export async function upsertProjectSettings(
   await query(
     `UPDATE project_settings SET ${sets.join(', ')} WHERE project_id = $${vals.length}`,
     vals,
+  )
+}
+
+// ─── Slack connector (single source of truth: project_settings) ──────────────────
+
+export interface SlackConnectorStatus {
+  slackConfigured: boolean
+  channel: string | null
+}
+
+/**
+ * Decrypted Slack config for a project — the single source the notifier reads.
+ * Returns nulls when not configured. NEVER log the returned token.
+ */
+export async function getProjectSlackConfig(
+  projectId: string,
+): Promise<{ channel: string | null; botToken: string | null }> {
+  const rows = await query<{ slack_channel: string | null; slack_bot_token_encrypted: Buffer | null }>(
+    'SELECT slack_channel, slack_bot_token_encrypted FROM project_settings WHERE project_id = $1',
+    [projectId],
+  )
+  const r = rows[0]
+  if (!r) return { channel: null, botToken: null }
+
+  let botToken: string | null = null
+  if (r.slack_bot_token_encrypted) {
+    try {
+      botToken = decryptSecret(r.slack_bot_token_encrypted)
+    } catch {
+      botToken = null // unreadable ciphertext → treat as not configured, never throw
+    }
+  }
+  return { channel: r.slack_channel ?? null, botToken }
+}
+
+/** Status for the GET endpoint — NEVER includes the token. */
+export async function getProjectSlackStatus(projectId: string): Promise<SlackConnectorStatus> {
+  const rows = await query<{ slack_channel: string | null; slack_bot_token_encrypted: Buffer | null }>(
+    'SELECT slack_channel, slack_bot_token_encrypted FROM project_settings WHERE project_id = $1',
+    [projectId],
+  )
+  const r = rows[0]
+  return { slackConfigured: Boolean(r?.slack_bot_token_encrypted), channel: r?.slack_channel ?? null }
+}
+
+/** Save the project's Slack channel + encrypted bot token (same AES helper as the LLM key). */
+export async function setProjectSlackConfig(
+  projectId: string,
+  input: { channel: string; botToken: string },
+): Promise<void> {
+  await query(
+    'INSERT INTO project_settings (project_id) VALUES ($1) ON CONFLICT (project_id) DO NOTHING',
+    [projectId],
+  )
+  await query(
+    'UPDATE project_settings SET slack_channel = $1, slack_bot_token_encrypted = $2, updated_at = now() WHERE project_id = $3',
+    [input.channel, encryptSecret(input.botToken), projectId],
   )
 }

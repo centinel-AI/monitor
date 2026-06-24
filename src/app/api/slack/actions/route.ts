@@ -1,17 +1,34 @@
 import { NextResponse } from 'next/server'
 import { query } from '@/lib/db/client'
+import { verifySlackSignature } from '@/lib/crypto/slack-signature'
 
-// IMPORTANT: This route is PUBLIC — Slack authenticates via signing secret,
-// not user sessions. Do not add cookie/session auth here.
-// Always return 200 to Slack (even on error) or Slack will retry the request.
+// IMPORTANT: This route is SELF_AUTH — Slack authenticates via its request
+// signature (global SLACK_SIGNING_SECRET), not user sessions. Do not add
+// cookie/session auth here. Returns 401 on an invalid/absent signature; once
+// authenticated, always returns 200 (even on a business error) so Slack does
+// not retry the request.
 
 export async function POST(request: Request): Promise<NextResponse> {
+  // Read the RAW body first — the HMAC is computed over it, before any parsing.
+  const rawBody = await request.text()
+
+  // Verify the Slack signature (timing-safe + 5-min replay window) before doing
+  // anything else. Missing secret/signature/timestamp, bad signature, or stale
+  // timestamp → generic 401 (never leak the secret or the computed digest).
+  const signingSecret = process.env.SLACK_SIGNING_SECRET
+  const signatureValid =
+    !!signingSecret &&
+    verifySlackSignature({
+      signingSecret,
+      signature: request.headers.get('x-slack-signature'),
+      timestamp: request.headers.get('x-slack-request-timestamp'),
+      rawBody,
+    })
+  if (!signatureValid) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
+  }
+
   try {
-    const rawBody = await request.text()
-
-    // TODO: Add SLACK_SIGNING_SECRET verification before production traffic
-    console.log('[slack/actions] received action')
-
     const payload = JSON.parse(
       new URLSearchParams(rawBody).get('payload') ?? '{}'
     ) as {
