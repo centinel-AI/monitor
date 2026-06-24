@@ -38,6 +38,7 @@ describe('GET /api/v1/settings', () => {
       llmModel:    null,
       llmApiKeyConfigured: true,
       apiKeyConfiguredAt: null,
+      autoPostmortem: false,
     })
     const res = await GET()
     const body = await res.json() as Record<string, unknown>
@@ -62,6 +63,7 @@ describe('GET /api/v1/settings', () => {
       llmModel:    null,
       llmApiKeyConfigured: true,
       apiKeyConfiguredAt: ts,
+      autoPostmortem: false,
     })
     const res = await GET()
     const body = await res.json() as Record<string, unknown>
@@ -90,6 +92,7 @@ describe('PUT /api/v1/settings', () => {
       llmModel:    null,
       llmApiKeyConfigured: true,
       apiKeyConfiguredAt: null,
+      autoPostmortem: false,
     })
     const res = await PUT(putReq({ llmProvider: 'openai', llmApiKey: 'sk-test' }))
     expect(res.status).toBe(200)
@@ -107,6 +110,7 @@ describe('PUT /api/v1/settings', () => {
       llmModel:    null,
       llmApiKeyConfigured: false,
       apiKeyConfiguredAt: null,
+      autoPostmortem: false,
     })
     const res = await PUT(putReq({ llmApiKey: null }))
     expect(res.status).toBe(200)

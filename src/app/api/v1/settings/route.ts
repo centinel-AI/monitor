@@ -4,21 +4,28 @@ import { getProjectSettings, upsertProjectSettings } from '@/lib/db/queries'
 
 const VALID_PROVIDERS = ['openai', 'anthropic'] as const
 
+const DEFAULT_SETTINGS = {
+  llmProvider: null,
+  llmModel: null,
+  llmApiKeyConfigured: false,
+  apiKeyConfiguredAt: null,
+  autoPostmortem: false,
+} as const
+
 export async function GET(): Promise<NextResponse> {
   const projectId = await getProjectId()
   const settings = await getProjectSettings(projectId)
 
-  return NextResponse.json(
-    settings ?? { llmProvider: null, llmModel: null, llmApiKeyConfigured: false, apiKeyConfiguredAt: null }
-  )
+  return NextResponse.json(settings ?? DEFAULT_SETTINGS)
 }
 
 export async function PUT(request: NextRequest): Promise<NextResponse> {
   const projectId = await getProjectId()
   const body = await request.json() as {
-    llmProvider?: unknown
-    llmApiKey?:   unknown
-    llmModel?:    unknown
+    llmProvider?:    unknown
+    llmApiKey?:      unknown
+    llmModel?:       unknown
+    autoPostmortem?: unknown
   }
 
   if (
@@ -32,6 +39,10 @@ export async function PUT(request: NextRequest): Promise<NextResponse> {
     )
   }
 
+  if (body.autoPostmortem !== undefined && typeof body.autoPostmortem !== 'boolean') {
+    return NextResponse.json({ error: 'autoPostmortem must be a boolean' }, { status: 400 })
+  }
+
   await upsertProjectSettings(projectId, {
     llmProvider: body.llmProvider as 'openai' | 'anthropic' | null | undefined,
     // Distinguish null (explicit removal → clear key) from undefined (leave
@@ -39,10 +50,9 @@ export async function PUT(request: NextRequest): Promise<NextResponse> {
     // since M.2.d; the handler now honors null instead of dropping it.
     llmApiKey:   body.llmApiKey === null ? null : typeof body.llmApiKey === 'string' ? body.llmApiKey : undefined,
     llmModel:    typeof body.llmModel  === 'string' ? body.llmModel  : undefined,
+    autoPostmortem: typeof body.autoPostmortem === 'boolean' ? body.autoPostmortem : undefined,
   })
 
   const updated = await getProjectSettings(projectId)
-  return NextResponse.json(
-    updated ?? { llmProvider: null, llmModel: null, llmApiKeyConfigured: false }
-  )
+  return NextResponse.json(updated ?? DEFAULT_SETTINGS)
 }

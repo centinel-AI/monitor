@@ -1,3 +1,4 @@
+import { getBoss, QUEUE } from '@/lib/queue/boss'
 import { getLLMClient } from '@/lib/llm/factory'
 import { POSTMORTEM_SYSTEM_PROMPT } from '@/lib/llm/prompts'
 import { FALLBACK_POSTMORTEM } from '@/lib/llm/fallback'
@@ -230,6 +231,69 @@ Generate a complete blameless postmortem in Spanish.
 export interface PostmortemJobPayload {
   projectId:  string
   incidentId: string
+}
+
+// ─── Shared enqueue path (manual endpoint + auto-on-resolve) ────────────────────
+
+export type EnqueuePostmortemResult =
+  | { status: 'queued'; jobId: string | null }
+  | { status: 'exists'; postmortem: string; generatedAt: string }
+  | { status: 'not_resolved' }
+  | { status: 'not_found' }
+
+/** True if pg-boss already has a pending/active postmortem job for this incident. */
+async function isPostmortemQueued(incidentId: string): Promise<boolean> {
+  try {
+    const rows = await query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pgboss.job
+          WHERE name = $1 AND state IN ('created', 'active', 'retry')
+            AND data->>'incidentId' = $2
+       ) AS exists`,
+      [QUEUE.POSTMORTEM, incidentId],
+    )
+    return rows[0]?.exists ?? false
+  } catch {
+    // pg-boss schema may be absent (boss not started in this environment).
+    return false
+  }
+}
+
+/**
+ * Single enqueue path for postmortem generation, shared by the manual endpoint
+ * and the auto-on-resolve trigger. Business short-circuits (no duplicate work):
+ *   not_found → incident not in project · not_resolved → status !== 'resolved'
+ *   exists    → already generated (returns it) · queued → enqueued OR already in flight.
+ * Scoped by project_id (project always from the caller / header).
+ */
+export async function enqueuePostmortem(
+  projectId: string,
+  incidentId: string,
+): Promise<EnqueuePostmortemResult> {
+  const rows = await query<{
+    status: string
+    postmortem: string | null
+    postmortem_generated_at: Date | string | null
+  }>(
+    'SELECT status, postmortem, postmortem_generated_at FROM incidents WHERE id = $1 AND project_id = $2',
+    [incidentId, projectId],
+  )
+  const inc = rows[0]
+  if (!inc) return { status: 'not_found' }
+  if (inc.status !== 'resolved') return { status: 'not_resolved' }
+  if (inc.postmortem) {
+    return {
+      status: 'exists',
+      postmortem: inc.postmortem,
+      generatedAt: inc.postmortem_generated_at ? new Date(inc.postmortem_generated_at).toISOString() : '',
+    }
+  }
+  // Already enqueued/generating → do not enqueue a second job.
+  if (await isPostmortemQueued(incidentId)) return { status: 'queued', jobId: null }
+
+  const boss = await getBoss()
+  const jobId = await boss.send(QUEUE.POSTMORTEM, { projectId, incidentId } satisfies PostmortemJobPayload)
+  return { status: 'queued', jobId }
 }
 
 // ─── Production wrapper (pg-boss handler) ─────────────────────────────────────

@@ -54,8 +54,8 @@ Auth col.: **T** = X-Service-Token, **P** = X-Grauss-Project-Id, **self** = self
 | `POST /api/v1/projects` | T+P | Alta idempotente de proyecto | `{ projectId?:uuid, name?:string }` · `projectId` debe == header | `201 {projectId, created:bool}` · `400` si UUID inválido o mismatch |
 | `GET /api/v1/projects/[projectId]` | T+P | Lee proyecto (path == header) | — | `200 {projectId, name, apiToken}` · `404 {error:'not found'}` · `400 'projectId mismatch'` |
 | `DELETE /api/v1/projects/[projectId]` | T+P | Borra proyecto | — | `204` (sin body) · `404` |
-| `GET /api/v1/settings` | T+P | Lee config LLM (sin la clave) | — | `200 {llmProvider, llmModel, llmApiKeyConfigured:bool, apiKeyConfiguredAt}` |
-| `PUT /api/v1/settings` | T+P | Set/clear config LLM (BYOK) | `{ llmProvider?:'openai'\|'anthropic'\|null, llmApiKey?:string\|null, llmModel?:string }` | `200 {…ProjectSettings}` · `400` si provider inválido. **Nunca** devuelve la clave |
+| `GET /api/v1/settings` | T+P | Lee config LLM (sin la clave) + toggle | — | `200 {llmProvider, llmModel, llmApiKeyConfigured:bool, apiKeyConfiguredAt, autoPostmortem:bool}` |
+| `PUT /api/v1/settings` | T+P | Set/clear config LLM (BYOK) + toggle | `{ llmProvider?:'openai'\|'anthropic'\|null, llmApiKey?:string\|null, llmModel?:string, autoPostmortem?:boolean }` | `200 {…ProjectSettings}` · `400` si provider inválido o `autoPostmortem` no booleano. **Nunca** devuelve la clave |
 | `GET /api/v1/sources` | **T** (sin P) | Catálogo global de fuentes | — | `200 {sources: SOURCES_CATALOG}` |
 | `GET /api/v1/sources/verify?source=` | T+P | Onboarding poll: ¿llegan eventos? | query `?source=` | `200 {connected:bool, lastEventAt, eventCount24h}` · `400 'invalid source'` |
 | `GET /api/v1/services` | T+P | **(M3)** Servicios + `status` derivado UP/DEGRADED/DOWN | — | `200 {services:[{id,name,source,namespace,criticality,status,latestScore,lastEventAt,eventCount24h,trend,sparklineData}]}` |
@@ -178,7 +178,7 @@ POST /api/webhooks/[source]  ── boss.send(monitor.dedup) ──▶
                                           POST /api/incidents/[id]/postmortem (202)
 ```
 
-> ⚠️ El eslabón **notify → postmortem NO existe**. Postmortem está desacoplado y es **manual** (la cadena pedida "…→notify→postmortem" no está conectada).
+> El postmortem se encola desde la **ruta manual** `POST /api/incidents/[id]/postmortem` Y, opt-in, **automáticamente al resolver** un incidente: `PATCH /api/incidents/[id]` con transición a `status='resolved'` encola `monitor.postmortem` **si `project_settings.auto_postmortem=true`** (best-effort, no bloquea el PATCH). Ambas vías comparten `enqueuePostmortem()` (short-circuit: ya generado / ya encolado). NO hay eslabón `notify→postmortem` (notify ocurre con el incidente aún `open`); el disparo natural es la **resolución**.
 
 - **Idempotencia:** sin `singletonKey` de pg-boss. Se hace en app con timestamps en `alert_groups` (`scored_at/correlated_at/notified_at/failed_at/last_error`, migración `…000001`): cada worker salta si su `*_at` ya está; scorer además debounce 2 min.
 
@@ -211,7 +211,7 @@ Confirmado en `src/lib/env.ts` y `src/middleware.ts`. Base URL del servicio para
 3. **Token de servicio: comparación ahora timing-safe** ✅ (`safeEqual` en `middleware.ts`). Sigue siendo **global** (no por-proyecto) por diseño — solo se endureció la comparación, no la semántica. BYO-token por proyecto sigue siendo solo para ingesta (`projects.api_token`); "BYOK por project" aplica solo a la clave LLM.
 4. **`projects.api_token` (ingesta) en igualdad SQL plana**, no hasheado ni timing-safe (`webhooks/[source]/route.ts:39`).
 5. **RAG embedding muerto.** `incidents.embedding vector(1536)` existe pero **nunca se escribe** (`postmortem.ts:214` "pgvector migration pending"). No hay búsqueda por similitud real.
-6. **Pipeline notify→postmortem desconectado.** El postmortem es manual (vía endpoint), no encadenado tras notify. La narrativa "dedup→score→correlate→notify→postmortem" automática **se corta en notify**.
+6. **notify→postmortem**: el postmortem **NO** se encadena tras notify (notify ocurre con el incidente `open`). En su lugar, **auto-postmortem ahora es opt-in vía `PATCH→resolved`** (`project_settings.auto_postmortem`, default false): al resolver un incidente se encola el postmortem si el proyecto lo activó (best-effort, misma vía/guarda que el endpoint manual). El postmortem manual sigue disponible. RAG/embeddings sigue sin tocar (decisión aparte).
 7. **UP/DEGRADED/DOWN no es columna: se DERIVA** (M3) en `service-status.ts` desde `latestScore` + `eventCount24h` (recencia). Services sigue sin columna de estado (no se tocó el esquema).
 8. ~~Faltan endpoints de lectura~~ → **RESUELTO (M3)**: `/api/v1/services`, `/api/v1/stats`, `/api/v1/alert-groups` exponen por HTTP la lógica que vivía en `dashboard-stats.ts`. Aditivo: no se tocó pipeline, esquema ni ingesta.
 9. **Incidentes sin `causa`/`acciones` estructuradas ni `score` propio:** el score viene del `alert_group` enlazado; causa/acciones solo viven en el texto `postmortem`.

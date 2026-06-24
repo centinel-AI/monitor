@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getProjectId } from '@/lib/auth/context'
 import { query } from '@/lib/db/client'
+import { getProjectAutoPostmortem } from '@/lib/db/queries'
+import { enqueuePostmortem } from '@/agents/postmortem'
 
 type DetailRow = {
   id: string
@@ -157,6 +159,14 @@ export async function PATCH(
     return NextResponse.json({ error: 'No valid fields to update' }, { status: 400 })
   }
 
+  // Read the prior status so we can detect a TRANSITION to 'resolved'
+  // (vs. re-resolving an already-resolved incident → no re-trigger).
+  const beforeRows = await query<{ status: string }>(
+    'SELECT status FROM incidents WHERE id = $1 AND project_id = $2',
+    [id, project_id],
+  )
+  const previousStatus = beforeRows[0]?.status ?? null
+
   vals.push(id, project_id)
   const incidentRows = await query<Record<string, unknown>>(
     `UPDATE incidents SET ${sets.join(', ')} WHERE id = $${vals.length - 1} AND project_id = $${vals.length} RETURNING *`,
@@ -165,6 +175,19 @@ export async function PATCH(
 
   if (incidentRows.length === 0) {
     return NextResponse.json({ error: 'Incident not found or access denied' }, { status: 404 })
+  }
+
+  // Auto-postmortem (opt-in, M.x): only on the transition INTO 'resolved'.
+  // Best-effort — never block or fail the PATCH; the shared enqueue helper
+  // short-circuits if a postmortem already exists or a job is already queued.
+  if (update.status === 'resolved' && previousStatus !== 'resolved') {
+    try {
+      if (await getProjectAutoPostmortem(project_id)) {
+        await enqueuePostmortem(project_id, id)
+      }
+    } catch (e) {
+      console.error(`[incidents PATCH] auto-postmortem enqueue failed for ${id} (non-blocking)`, e)
+    }
   }
 
   return NextResponse.json({ incident: incidentRows[0] })

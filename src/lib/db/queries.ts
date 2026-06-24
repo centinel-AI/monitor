@@ -216,12 +216,14 @@ export interface ProjectSettings {
   llmApiKeyConfigured: boolean
   llmModel:           string | null
   apiKeyConfiguredAt: string | null
+  autoPostmortem:     boolean
 }
 
 export interface ProjectSettingsPatch {
   llmProvider?: 'openai' | 'anthropic' | null
   llmApiKey?:   string | null
   llmModel?:    string | null
+  autoPostmortem?: boolean
 }
 
 /**
@@ -233,8 +235,9 @@ export async function getProjectSettings(projectId: string): Promise<ProjectSett
     llm_api_key_encrypted:  Buffer | null
     llm_model:              string | null
     llm_api_key_updated_at: Date | string | null
+    auto_postmortem:        boolean
   }>(
-    'SELECT llm_provider, llm_api_key_encrypted, llm_model, llm_api_key_updated_at FROM project_settings WHERE project_id = $1',
+    'SELECT llm_provider, llm_api_key_encrypted, llm_model, llm_api_key_updated_at, auto_postmortem FROM project_settings WHERE project_id = $1',
     [projectId],
   )
   if (rows.length === 0) return null
@@ -248,7 +251,17 @@ export async function getProjectSettings(projectId: string): Promise<ProjectSett
     apiKeyConfiguredAt:  hasKey && r.llm_api_key_updated_at !== null
       ? new Date(r.llm_api_key_updated_at).toISOString()
       : null,
+    autoPostmortem:      r.auto_postmortem === true,
   }
+}
+
+/** Whether the project opted into auto-generating postmortems on resolve. */
+export async function getProjectAutoPostmortem(projectId: string): Promise<boolean> {
+  const rows = await query<{ auto_postmortem: boolean }>(
+    'SELECT auto_postmortem FROM project_settings WHERE project_id = $1',
+    [projectId],
+  )
+  return rows[0]?.auto_postmortem === true
 }
 
 /**
@@ -279,6 +292,9 @@ export async function upsertProjectSettings(
   }
   if (patch.llmModel !== undefined) {
     sets.push(`llm_model = $${vals.push(patch.llmModel)}`)
+  }
+  if (patch.autoPostmortem !== undefined) {
+    sets.push(`auto_postmortem = $${vals.push(patch.autoPostmortem)}`)
   }
 
   if (vals.length === 0) return
